@@ -75,6 +75,17 @@ CSE_API_KEY    = st.secrets.get("GOOGLE_CSE_API_KEY", os.getenv("GOOGLE_CSE_API_
 CSE_CX         = st.secrets.get("GOOGLE_CSE_CX", os.getenv("GOOGLE_CSE_CX"))
 COLUMNS = ["Website Link", "Email ID", "Phone Number", "Practice Name", "Address", "Timestamp (IST)"] #For google sheet updation
 
+# Debug: Check API keys configuration (REMOVE AFTER DEBUGGING)
+st.sidebar.write("🔧 Debug Info:")
+st.sidebar.write("Places API Key present:", bool(PLACES_API_KEY))
+st.sidebar.write("CSE API Key present:", bool(CSE_API_KEY))
+st.sidebar.write("CSE CX present:", bool(CSE_CX))
+
+if PLACES_API_KEY:
+    st.sidebar.write("Places API Key length:", len(PLACES_API_KEY))
+if CSE_API_KEY:
+    st.sidebar.write("CSE API Key length:", len(CSE_API_KEY))
+
 
 # ------------------------ Utility & API helpers ------------------------
 def _valid_email(s: str) -> bool:
@@ -171,15 +182,25 @@ def prefill_from_website(website_url: str):
 def fetch_html(url: str):
     if not url:
         return None, None
+
+    st.sidebar.write(f"🌐 Fetching website: {url[:50]}...")
+
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         t0 = time.time()
         r = requests.get(url, headers=headers, timeout=10)
         elapsed = time.time() - t0
+
+        st.sidebar.write(f"📡 Website Response: {r.status_code} ({elapsed:.2f}s)")
+
         if r.status_code == 200:
+            st.sidebar.write("✅ Website fetched successfully")
             return BeautifulSoup(r.text, "html.parser"), elapsed
-    except Exception:
-        pass
+        else:
+            st.sidebar.write(f"❌ Website fetch failed: {r.status_code}")
+    except Exception as e:
+        st.sidebar.write(f"❌ Website fetch exception: {str(e)}")
+
     return None, None
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -195,11 +216,28 @@ def get_domain(url: str):
 # --- Google Places ---
 @st.cache_data(show_spinner=False, ttl=3600)
 def places_text_search(query: str):
-    if not PLACES_API_KEY: return None
+    if not PLACES_API_KEY:
+        st.sidebar.write("❌ Places API Key missing")
+        return None
+
+    st.sidebar.write(f"🔍 Making Places text search: {query[:50]}...")
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {"query": query, "key": PLACES_API_KEY}
-    r = requests.get(url, params=params, timeout=10)
-    return r.json() if r.status_code == 200 else None
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        st.sidebar.write(f"📡 Places API Response Status: {r.status_code}")
+
+        if r.status_code == 200:
+            data = r.json()
+            st.sidebar.write(f"✅ Places API Success - Results: {len(data.get('results', []))}")
+            return data
+        else:
+            st.sidebar.write(f"❌ Places API Error: {r.text[:200]}")
+            return None
+    except Exception as e:
+        st.sidebar.write(f"❌ Places API Exception: {str(e)}")
+        return None
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def places_find_place(text_query: str):
