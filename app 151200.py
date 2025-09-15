@@ -38,23 +38,7 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 ASSETS_DIR = os.path.join(os.getcwd(), "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
-# Check if report is ready to display (move this to top)
-if st.session_state.get('report_ready', False):
-    # Display only the report at the top of the page
-    components.html(st.session_state.report_html, height=1000, scrolling=True)
 
-    # Reset button below the report
-    if st.button("🔄 Run Another Audit", use_container_width=True):
-        # Clear session state to start fresh
-        for key in ['draft', 'final', 'submitted', 'last_fetched_website', 'opened_report_id', 'report_ready', 'report_html']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.rerun()
-
-    # Stop rendering the rest of the page
-    st.stop()
-
-# Show the form only if report is not ready
 st.title("🦷 Face Value Audit")
 st.subheader("A free tool to evaluate your practice's online presence & patient experience")
 
@@ -1620,9 +1604,106 @@ if st.session_state.submitted:
             final, overview, visibility, reputation, marketing, experience, scores, reviews
         )
 
-        # Set a flag to indicate report is ready
-        st.session_state.report_ready = True
-        st.session_state.report_html = report_html
+        # Base64 encode and create a deterministic id (prevents re-opening on rerun)
+        b64 = base64.b64encode(report_html.encode("utf-8")).decode("ascii")
+        report_id = hashlib.sha1(b64.encode("ascii")).hexdigest()
 
-        # Trigger a rerun to display the report at the top
+        # Open report in new tab exactly once per audit
+        if st.session_state.opened_report_id != report_id:
+            # Use Blob to avoid long data URLs hitting browser limits
+            components.html(f"""
+            <script>
+            function openReportInNewTab() {{
+                const data = atob("{b64}");
+                const blob = new Blob([data], {{type: "text/html"}});
+                const url = URL.createObjectURL(blob);
+
+                // Open in new tab
+                const newWindow = window.open(url, "_blank");
+
+                // Check if popup was blocked
+                if (!newWindow || newWindow.closed || typeof newWindow.closed == 'undefined') {{
+                    alert("Popup blocked! Please allow popups for this site and click the download button below.");
+                }} else {{
+                    console.log("Report opened successfully in new tab");
+                }}
+
+                // Clean up the object URL after a short delay
+                setTimeout(() => URL.revokeObjectURL(url), 2000);
+            }}
+
+            // Try to open immediately
+            setTimeout(openReportInNewTab, 100);
+            </script>
+            """, height=100, width=0)
+            st.session_state.opened_report_id = report_id
+
+    # Show success message and quick summary
+    st.success("✅ Your Face Value Audit Report has been generated!")
+
+    # Manual open button (primary action)
+    st.markdown("### 📊 View Your Report")
+
+    # Create data URL for direct access
+    data_url = f"data:text/html;base64,{b64}"
+
+    # Manual open button with direct data URL
+    st.markdown(f"""
+    <div style="text-align: center; margin: 20px 0;">
+        <a href="{data_url}" target="_blank" style="text-decoration: none;">
+            <button style="
+                background: linear-gradient(90deg, #6D28D9, #4F46E5);
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                box-shadow: 0 4px 12px rgba(109,40,217,0.3);
+                transition: transform 0.2s ease;
+            "
+            onmouseover="this.style.transform='translateY(-2px)'"
+            onmouseout="this.style.transform='translateY(0px)'">
+                🚀 Open Full Report in New Tab
+            </button>
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Quick summary on the same page
+    st.markdown("### 📈 Quick Summary")
+    c1, c2, c3, c4 = st.columns(4)
+    bucket_card(c1, "Overall Score", smile, 100)
+    bucket_card(c2, "Visibility Score", vis_score, 30)
+    bucket_card(c3, "Reputation Score", rep_score, 40)
+    bucket_card(c4, "Experience Score", exp_score, 30)
+
+    # Alternative access options
+    st.markdown("---")
+    st.markdown("### 📥 Alternative Access")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.download_button(
+            label="📄 Download Report as HTML",
+            data=report_html,
+            file_name=f"face_value_audit_{final.get('practice_name', 'report').replace(' ', '_').lower()}.html",
+            mime="text/html",
+            use_container_width=True
+        )
+
+    with col2:
+        # Copy link button
+        if st.button("📋 Copy Report Link", use_container_width=True):
+            st.code(data_url, language=None)
+            st.info("Copy the above link to share your report!")
+
+    # Reset button to run another audit
+    if st.button("🔄 Run Another Audit", use_container_width=True):
+        # Clear session state to start fresh
+        for key in ['draft', 'final', 'submitted', 'last_fetched_website', 'opened_report_id']:
+            if key in st.session_state:
+                del st.session_state[key]
         st.rerun()
