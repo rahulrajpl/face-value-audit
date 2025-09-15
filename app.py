@@ -76,10 +76,10 @@ CSE_CX         = st.secrets.get("GOOGLE_CSE_CX", os.getenv("GOOGLE_CSE_CX"))
 COLUMNS = ["Website Link", "Email ID", "Phone Number", "Practice Name", "Address", "Timestamp (IST)"] #For google sheet updation
 
 # Debug: Check API keys configuration (REMOVE AFTER DEBUGGING)
-st.sidebar.write("🔧 Debug Info:")
-st.sidebar.write("Places API Key present:", bool(PLACES_API_KEY))
-st.sidebar.write("CSE API Key present:", bool(CSE_API_KEY))
-st.sidebar.write("CSE CX present:", bool(CSE_CX))
+# st.sidebar.write("🔧 Debug Info:")
+# st.sidebar.write("Places API Key present:", bool(PLACES_API_KEY))
+# st.sidebar.write("CSE API Key present:", bool(CSE_API_KEY))
+# st.sidebar.write("CSE CX present:", bool(CSE_CX))
 
 if PLACES_API_KEY:
     st.sidebar.write("Places API Key length:", len(PLACES_API_KEY))
