@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from html import escape
 
+
 # For Report Generation
 import base64, json, hashlib
 import streamlit.components.v1 as components
@@ -23,6 +24,16 @@ from datetime import datetime
 
 # ------------------------ Page & Config ------------------------
 st.set_page_config(page_title="🦷 Face Value Audit", layout="wide")
+
+# Hide Streamlit watermark
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 ASSETS_DIR = os.path.join(os.getcwd(), "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
