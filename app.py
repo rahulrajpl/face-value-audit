@@ -25,12 +25,62 @@ from datetime import datetime
 # ------------------------ Page & Config ------------------------
 st.set_page_config(page_title="Face Value Audit", layout="wide")
 
-# Hide Streamlit watermark
+# Hide Streamlit watermark and force white theme
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
+
+    /* Force white theme */
+    .stApp {
+        background-color: white !important;
+    }
+
+    .main .block-container {
+        background-color: white !important;
+    }
+
+    /* Force white background for all elements */
+    .stSelectbox > div > div,
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stButton > button,
+    .stForm,
+    .stDataFrame,
+    .stTable,
+    .stMetric,
+    .stAlert,
+    .stSidebar .block-container {
+        background-color: white !important;
+        color: black !important;
+    }
+
+    /* Sidebar white theme */
+    .stSidebar {
+        background-color: white !important;
+    }
+
+    /* Input fields */
+    input, textarea, select {
+        background-color: white !important;
+        color: black !important;
+        border: 1px solid #ddd !important;
+    }
+
+    /* Text colors */
+    h1, h2, h3, h4, h5, h6, p, span, div, label {
+        color: black !important;
+    }
+
+    /* Remove any dark theme artifacts */
+    [data-testid="stAppViewContainer"] {
+        background-color: white !important;
+    }
+
+    [data-testid="stHeader"] {
+        background-color: white !important;
+    }
     </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
