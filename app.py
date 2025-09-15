@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo  # stdlib; for IST timestamp if you later want it
 from datetime import datetime
 
 # ------------------------ Page & Config ------------------------
-st.set_page_config(page_title="🦷 Face Value Audit", layout="wide")
+st.set_page_config(page_title="Face Value Audit", layout="wide")
 
 # Hide Streamlit watermark
 hide_streamlit_style = """
@@ -55,8 +55,22 @@ if st.session_state.get('report_ready', False):
     st.stop()
 
 # Show the form only if report is not ready
-st.title("🦷 Face Value Audit")
-st.subheader("A free tool to evaluate your practice's online presence & patient experience")
+# Centered logo and title
+with open("assets/logo-big.png", "rb") as logo_file:
+    logo_base64 = base64.b64encode(logo_file.read()).decode()
+
+st.markdown(f"""
+<div style="text-align: center; margin-bottom: 2rem;">
+    <img src="data:image/png;base64,{logo_base64}" width="200" style="margin-bottom: 1rem;">
+    <h1 style="margin: 0; font-size: 3rem; color: #262730;">Face Value Audit</h1>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<h3 style="text-align: center; color: #666; margin-bottom: 2rem;">
+A free tool to evaluate your practice's online presence & patient experience
+</h3>
+""", unsafe_allow_html=True)
 
 
 # one-time bootstrap
@@ -662,7 +676,7 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
     addr_html = f'<a href="{escape(maps)}" target="_blank" rel="noopener">{escape(addr)}</a>' if (maps and final.get("address")) else escape(addr)
 
     header = f"""
-      <h1>🦷 Face Value Audit Report</h1>
+      <h1>Face Value Audit Report</h1>
       <h2>{escape(title)}</h2>
       <div class="header-info">
         <strong>Website:</strong> {escape(final.get('website','—'))} &nbsp;|&nbsp;
