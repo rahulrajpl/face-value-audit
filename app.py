@@ -6,11 +6,83 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 from html import escape
-
+import asyncio
+import concurrent.futures
+from functools import lru_cache
 
 # For Report Generation
 import base64, json, hashlib
 import streamlit.components.v1 as components
+
+# For LLM-based social media analysis
+try:
+    import anthropic
+    HAS_CLAUDE = True
+except ImportError:
+    HAS_CLAUDE = False
+
+# Enhanced caching with LRU and memory management
+from functools import lru_cache
+import sys
+
+# Global variable to store single LLM analysis result to avoid multiple API calls
+_llm_analysis_cache = {}
+_cache_max_size = 100  # Limit cache size to prevent memory issues
+
+class AdvancedLLMCache:
+    def __init__(self, max_size=100):
+        self.cache = {}
+        self.max_size = max_size
+        self.access_order = []
+
+    def get(self, key):
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key, value):
+        # Remove oldest if cache is full
+        if len(self.cache) >= self.max_size and key not in self.cache:
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+
+        self.cache[key] = value
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+
+    def clear(self):
+        self.cache.clear()
+        self.access_order.clear()
+
+# Initialize advanced cache
+_advanced_cache = AdvancedLLMCache(max_size=_cache_max_size)
+
+# Claude API helper function
+def call_claude_api(prompt: str, model: str = "claude-3-haiku-20240307") -> str:
+    """Helper function to call Claude API"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and claude_client):
+        return None
+
+    try:
+        response = claude_client.messages.create(
+            model=model,
+            max_tokens=1024,
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+        return response.content[0].text
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Claude API error: {str(e)[:100]}")
+        return None
 
 # one-time session flag so we don't open multiple tabs on reruns
 if "opened_report_id" not in st.session_state:
@@ -160,7 +232,14 @@ if "last_fetched_website" not in st.session_state:
 PLACES_API_KEY = st.secrets.get("GOOGLE_PLACES_API_KEY", os.getenv("GOOGLE_PLACES_API_KEY"))
 CSE_API_KEY    = st.secrets.get("GOOGLE_CSE_API_KEY", os.getenv("GOOGLE_CSE_API_KEY"))
 CSE_CX         = st.secrets.get("GOOGLE_CSE_CX", os.getenv("GOOGLE_CSE_CX"))
-COLUMNS = ["Website Link", "Email ID", "Phone Number", "Practice Name", "Address", "Timestamp (IST)"] #For google sheet updation
+CLAUDE_API_KEY = st.secrets.get("CLAUDE_API_KEY", os.getenv("CLAUDE_API_KEY"))
+
+# Configure Claude if available
+if HAS_CLAUDE and CLAUDE_API_KEY:
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+else:
+    claude_client = None
+COLUMNS = ["Website Link", "Doctor Name", "Email ID", "Phone Number", "Practice Name", "Address", "Timestamp (IST)"] #For google sheet updation
 
 # Debug: Check API keys configuration (REMOVE AFTER DEBUGGING)
 # st.sidebar.write("🔧 Debug Info:")
@@ -232,37 +311,339 @@ def extract_address_and_maplink(soup: BeautifulSoup):
 
     return None, None
 
+# LLM-powered extraction functions
+def extract_practice_name_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract practice name using LLM if traditional methods fail"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:1500]  # Limit for faster processing
+
+        # Create focused prompt for practice name extraction
+        prompt = f"""
+        Extract the dental practice name from this website content.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Find the official business/practice name (not doctor's personal name unless it's the practice name)
+        - Look for names like "Smith Dental", "Family Dentistry", "Dental Associates", etc.
+        - Ignore generic terms like "Dentist" or "Dental Services" alone
+        - Return ONLY the exact practice name as it appears, with no additional text or descriptions
+        - Do not add any descriptive words or explanations
+        - If no clear practice name exists, return "NOT_FOUND"
+
+        Practice Name:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        # Validate the result
+        if (result and result != "NOT_FOUND" and len(result) > 2 and len(result) < 100 and
+            not result.lower().startswith('http') and  # Not a URL
+            not result.lower() in ['dentist', 'dental', 'dental services', 'dental office']):  # Not generic terms
+            return result.title()  # Proper case formatting
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM name extraction failed: {str(e)[:50]}")
+        return None
+
+def extract_address_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract physical address using LLM if traditional methods fail"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:1500]
+
+        # Create focused prompt for address extraction
+        prompt = f"""
+        Extract the physical address of this dental practice from the website content.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Find the complete physical address (street, city, state/province, zip/postal code)
+        - Look for contact sections, footer, about pages
+        - Return ONLY the full address in standard format
+        - If multiple locations, return the main/primary address
+        - If no physical address exists, return "NOT_FOUND"
+        - Do not include phone numbers or email addresses
+
+        Physical Address:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        # Validate the result - should contain typical address components
+        if (result and result != "NOT_FOUND" and
+            len(result) > 10 and len(result) < 200 and
+            not result.lower().startswith('http') and  # Not a URL
+            any(word in result.lower() for word in ['street', 'st', 'avenue', 'ave', 'road', 'rd', 'drive', 'dr', 'lane', 'ln', 'blvd', 'suite', 'ste', 'way', 'place', 'circle', 'court']) and
+            any(char.isdigit() for char in result)):  # Should contain at least one number
+            return result.strip()
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM address extraction failed: {str(e)[:50]}")
+        return None
+
+def extract_doctor_name_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract main doctor name using LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:1500]
+
+        # Create focused prompt for doctor name extraction
+        prompt = f"""
+        Extract the main doctor's name from this dental practice website content.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Find the primary dentist/doctor's full name
+        - Look for "Dr.", "Doctor", "Meet Dr.", "About Dr.", etc.
+        - Return ONLY the doctor's name with title (e.g., "Dr. John Smith")
+        - If multiple doctors, return the main/primary one
+        - If no clear doctor name exists, return "NOT_FOUND"
+
+        Doctor Name:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        # Validate the result
+        if (result and result != "NOT_FOUND" and
+            len(result) > 3 and len(result) < 100 and
+            not result.lower().startswith('http')):
+            return result
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM doctor name extraction failed: {str(e)[:50]}")
+        return None
+
+def extract_email_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract contact email using LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:1500]
+
+        # Create focused prompt for email extraction
+        prompt = f"""
+        Extract the main contact email address from this dental practice website content.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Find the primary contact email address
+        - Look for contact sections, footer, about pages
+        - Return ONLY the email address (e.g., "info@practice.com")
+        - If multiple emails, return the main contact one (avoid personal emails)
+        - If no email exists, return "NOT_FOUND"
+
+        Email Address:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        # Validate the result with email regex
+        if (result and result != "NOT_FOUND" and
+            _valid_email(result)):
+            return result
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM email extraction failed: {str(e)[:50]}")
+        return None
+
+def extract_phone_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract contact phone using LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:1500]
+
+        # Create focused prompt for phone extraction
+        prompt = f"""
+        Extract the main contact phone number from this dental practice website content.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Find the primary contact phone number
+        - Look for contact sections, header, footer
+        - Return ONLY the phone number (e.g., "(555) 123-4567" or "555-123-4567")
+        - If multiple phones, return the main office line
+        - If no phone exists, return "NOT_FOUND"
+
+        Phone Number:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        # Validate the result with phone regex
+        if (result and result != "NOT_FOUND" and
+            _valid_phone(result)):
+            return result
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM phone extraction failed: {str(e)[:50]}")
+        return None
+
 def prefill_from_website(website_url: str):
-    """Fetch page → extract name+address → Places fallback → store in session_state.draft"""
+    """Fetch page → extract doctor name, email, phone, practice name, and address → store in session_state.draft with messaging"""
     if not website_url:
         return
 
-    # fetch & parse
-    soup, _ = fetch_html(website_url)  # reuse your existing fetch_html(url) -> (soup, html_text)
+    # Initialize error messages
+    email_message = ""
+    phone_message = ""
+    name_message = ""
+    address_message = ""
 
-    name = extract_practice_name(soup)
+    # Store the last error for better messaging
+    st.session_state.last_fetch_error = None
+
+    # fetch & parse
+    soup, load_time = fetch_html(website_url)
+
+    if not soup:
+        # More specific error messages based on what happened
+        error_type = st.session_state.get("last_fetch_error", "unknown")
+
+        error_messages = {
+            "blocked": "Website blocked automated access",
+            "not_found": "Website not found",
+            "server_error": "Website server error",
+            "timeout": "Website took too long to respond",
+            "connection": "Could not connect to website",
+            "request_error": "Network request failed",
+            "failed": "Website fetch failed",
+            "unexpected": "Unexpected error occurred",
+            "unknown": "Couldn't load website"
+        }
+
+        error_msg = error_messages.get(error_type, "Couldn't load website")
+
+        st.session_state.draft.update({
+            "website": website_url,
+            "email": "",
+            "phone": "",
+            "practice_name": "",
+            "address": "",
+            "maps_link": "",
+            "email_message": f"{error_msg}. Please fill email manually.",
+            "phone_message": f"{error_msg}. Please fill phone manually.",
+            "name_message": f"{error_msg}. Please fill practice name manually.",
+            "address_message": f"{error_msg}. Please fill address manually.",
+        })
+        return
+
+    # Step 1: Try traditional extraction methods for practice name and address
+    practice_name = extract_practice_name(soup)
     addr, maps_link = extract_address_and_maplink(soup)
 
-    # Places fallback if address or name missing and Places API is available
-    if not name or not addr:
-        pid = find_best_place_id(name, "", website_url)  # your existing helper; keep signature consistent
+    # Step 2: Use LLM extraction for missing fields
+    st.sidebar.write("🤖 Using AI to extract contact details...")
+
+    if not practice_name:
+        practice_name = extract_practice_name_with_llm(soup, website_url)
+
+    if not addr:
+        addr = extract_address_with_llm(soup, website_url)
+
+    # Extract email and phone using LLM
+    email = extract_email_with_llm(soup, website_url)
+    phone = extract_phone_with_llm(soup, website_url)
+
+    # Step 3: Places API fallback for practice name and address if still missing
+    if not practice_name or not addr:
+        pid = find_best_place_id(practice_name or "", "", website_url)
         if pid:
-            det = places_details(pid)  # your existing helper
+            det = places_details(pid)
             if det and det.get("status") == "OK":
                 r = det["result"]
-                if not name:
-                    name = r.get("name") or name
+                if not practice_name:
+                    practice_name = r.get("name") or practice_name
                 if not addr:
                     addr = r.get("formatted_address") or addr
+                if not phone:
+                    phone = r.get("international_phone_number") or phone
                 if pid and not maps_link:
                     maps_link = f"https://www.google.com/maps/search/?api=1&query=place_id:{pid}"
 
+    # Step 4: Set messages for missing information and success indicators
+    if not email:
+        email_message = "Couldn't get the email from website. Please fill it manually."
+    else:
+        st.sidebar.success(f"✅ Email extracted: {email}")
+
+    if not phone:
+        phone_message = "Couldn't get the phone from website. Please fill it manually."
+    else:
+        st.sidebar.success(f"✅ Phone extracted: {phone}")
+
+    if not practice_name:
+        name_message = "Couldn't get the practice name from website. Please fill it manually."
+    else:
+        st.sidebar.success(f"✅ Practice name extracted: {practice_name[:40]}{'...' if len(practice_name) > 40 else ''}")
+
+    if not addr:
+        address_message = "Couldn't get the address from website. Please fill it manually."
+    else:
+        st.sidebar.success(f"✅ Address extracted: {addr[:40]}{'...' if len(addr) > 40 else ''}")
+
+    # Update session state with results and messages
     st.session_state.draft.update({
         "website": website_url,
-        # user-provided below remain as-is; we set defaults in the UI
-        "practice_name": name or "",
+        "email": email or "",
+        "phone": phone or "",
+        "practice_name": practice_name or "",
         "address": addr or "",
         "maps_link": maps_link or "",
+        "email_message": email_message,
+        "phone_message": phone_message,
+        "name_message": name_message,
+        "address_message": address_message,
     })
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -273,9 +654,18 @@ def fetch_html(url: str):
     st.sidebar.write(f"🌐 Fetching website: {url[:50]}...")
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
+        # More comprehensive headers to avoid blocking
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+
         t0 = time.time()
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         elapsed = time.time() - t0
 
         st.sidebar.write(f"📡 Website Response: {r.status_code} ({elapsed:.2f}s)")
@@ -283,10 +673,30 @@ def fetch_html(url: str):
         if r.status_code == 200:
             st.sidebar.write("✅ Website fetched successfully")
             return BeautifulSoup(r.text, "html.parser"), elapsed
+        elif r.status_code == 403:
+            st.sidebar.write("⚠️ Website blocked automated access (403 Forbidden)")
+            st.session_state.last_fetch_error = "blocked"
+        elif r.status_code == 404:
+            st.sidebar.write("❌ Website not found (404)")
+            st.session_state.last_fetch_error = "not_found"
+        elif r.status_code >= 500:
+            st.sidebar.write(f"⚠️ Website server error ({r.status_code})")
+            st.session_state.last_fetch_error = "server_error"
         else:
             st.sidebar.write(f"❌ Website fetch failed: {r.status_code}")
+            st.session_state.last_fetch_error = "failed"
+    except requests.exceptions.Timeout:
+        st.sidebar.write("⏰ Website request timed out")
+        st.session_state.last_fetch_error = "timeout"
+    except requests.exceptions.ConnectionError:
+        st.sidebar.write("🔌 Could not connect to website")
+        st.session_state.last_fetch_error = "connection"
+    except requests.exceptions.RequestException as e:
+        st.sidebar.write(f"❌ Request error: {str(e)[:50]}")
+        st.session_state.last_fetch_error = "request_error"
     except Exception as e:
-        st.sidebar.write(f"❌ Website fetch exception: {str(e)}")
+        st.sidebar.write(f"❌ Unexpected error: {str(e)[:50]}")
+        st.session_state.last_fetch_error = "unexpected"
 
     return None, None
 
@@ -458,31 +868,638 @@ def website_health(url: str, soup: BeautifulSoup, load_time: float):
         checks.append("Load speed ❓")
     return f"{min(score,100)}/100", " | ".join(checks)
 
-def social_presence_from_site(soup: BeautifulSoup):
-    if not soup: return "None"
-    links = [a.get("href") or "" for a in soup.find_all("a", href=True)]
-    fb = any("facebook.com" in l for l in links)
-    ig = any("instagram.com" in l for l in links)
-    if fb and ig: return "Facebook, Instagram"
-    if fb: return "Facebook"
-    if ig: return "Instagram"
-    return "None"
+@st.cache_data(show_spinner=False, ttl=3600)
+def social_presence_from_site(_soup: BeautifulSoup):
+    """Extract social media presence with comprehensive search including text-based detection"""
+    if not _soup:
+        return {"platforms": [], "links": {}, "summary": "None"}
 
-def media_count_from_site(soup: BeautifulSoup):
-    if not soup: return "Search limited"
-    imgs = len(soup.find_all("img"))
-    vids = len(soup.find_all(["video","source"]))
-    return f"{imgs} photos, {vids} videos"
+    platforms_found = {}
 
-def advertising_signals(soup: BeautifulSoup):
-    if not soup: return "Search limited"
-    html = str(soup)
+    # STEP 1: Search for any text mentioning social media accounts (as requested)
+    page_text = _soup.get_text(" ", strip=True)
+
+    # Search for Facebook references in text
+    fb_patterns = [
+        r"facebook\.com/[\w./-]+",
+        r"@[\w.]+\s*on\s*facebook",
+        r"facebook[:\s]*[@]?[\w.]+",
+        r"fb\.com/[\w./-]+",
+        r"find us on facebook[:\s]*[@]?[\w.]*"
+    ]
+
+    for pattern in fb_patterns:
+        matches = re.findall(pattern, page_text, re.IGNORECASE)
+        if matches:
+            # Take the first match and try to construct a proper URL
+            match = matches[0].strip()
+            if match.startswith(('facebook.com/', 'fb.com/')):
+                if not match.startswith('http'):
+                    platforms_found["Facebook"] = f"https://www.{match}"
+                else:
+                    platforms_found["Facebook"] = match
+            break
+
+    # Search for Instagram references in text
+    ig_patterns = [
+        r"instagram\.com/[\w./-]+",
+        r"@[\w.]+\s*on\s*instagram",
+        r"instagram[:\s]*[@]?[\w.]+",
+        r"insta[:\s]*[@]?[\w.]+"
+    ]
+
+    for pattern in ig_patterns:
+        matches = re.findall(pattern, page_text, re.IGNORECASE)
+        if matches:
+            match = matches[0].strip()
+            if 'instagram.com/' in match:
+                if not match.startswith('http'):
+                    platforms_found["Instagram"] = f"https://www.{match}"
+                else:
+                    platforms_found["Instagram"] = match
+            break
+
+    # Search for Twitter/X references in text
+    twitter_patterns = [
+        r"twitter\.com/[\w./-]+",
+        r"x\.com/[\w./-]+",
+        r"@[\w.]+\s*on\s*twitter",
+        r"twitter[:\s]*[@]?[\w.]+",
+        r"tweet\s*[@]?[\w.]+"
+    ]
+
+    for pattern in twitter_patterns:
+        matches = re.findall(pattern, page_text, re.IGNORECASE)
+        if matches:
+            match = matches[0].strip()
+            if any(domain in match for domain in ['twitter.com/', 'x.com/']):
+                if not match.startswith('http'):
+                    platforms_found["Twitter"] = f"https://www.{match}"
+                else:
+                    platforms_found["Twitter"] = match
+            break
+
+    # Search for Yelp references in text
+    yelp_patterns = [
+        r"yelp\.com/biz/[\w./-]+",
+        r"yelp[:\s]*[\w.\s-]+",
+        r"find us on yelp"
+    ]
+
+    for pattern in yelp_patterns:
+        matches = re.findall(pattern, page_text, re.IGNORECASE)
+        if matches:
+            match = matches[0].strip()
+            if 'yelp.com/biz/' in match:
+                if not match.startswith('http'):
+                    platforms_found["Yelp"] = f"https://www.{match}"
+                else:
+                    platforms_found["Yelp"] = match
+            break
+
+    # STEP 2: If text search didn't find everything, search HTML links more broadly
+    all_links = [a.get("href", "") for a in _soup.find_all("a", href=True)]
+
+    # Define patterns that suggest it's NOT the practice's profile (more selective now)
+    exclude_patterns = [
+        "/sharer", "/share.php", "/plugins", "/tr/", "/intent/", "/embed/",
+        "oauth", "login", "api.facebook", "developers.", "business.facebook.com/help"
+    ]
+
+    for href in all_links:
+        href_lower = href.lower()
+
+        # Skip obvious sharing/widget links
+        if any(pattern in href_lower for pattern in exclude_patterns):
+            continue
+
+        # Facebook detection - be more permissive
+        if "facebook.com/" in href_lower and "Facebook" not in platforms_found:
+            # More inclusive - accept most facebook.com links that aren't sharing widgets
+            if href_lower.count("/") >= 3:  # Has some path after facebook.com
+                platforms_found["Facebook"] = href
+
+        # Instagram detection - more permissive
+        elif "instagram.com/" in href_lower and "Instagram" not in platforms_found:
+            if href_lower.count("/") >= 3:  # Has some path after instagram.com
+                platforms_found["Instagram"] = href
+
+        # Twitter/X detection - more permissive
+        elif ("twitter.com/" in href_lower or "x.com/" in href_lower) and "Twitter" not in platforms_found:
+            if href_lower.count("/") >= 3:  # Has some path after twitter.com/x.com
+                platforms_found["Twitter"] = href
+
+        # Yelp detection
+        elif "yelp.com/biz/" in href_lower and "Yelp" not in platforms_found:
+            platforms_found["Yelp"] = href
+
+    # STEP 3: Look for social media icons or widgets (even if no direct links)
+    # Search for common social media class names and data attributes
+    social_elements = []
+
+    # Look for Font Awesome icons, common CSS classes, and data attributes
+    for element in _soup.find_all(['i', 'span', 'div', 'a'], class_=True):
+        classes = ' '.join(element.get('class', [])).lower()
+        if any(social in classes for social in ['fa-facebook', 'facebook', 'fb-', 'icon-facebook']):
+            if "Facebook" not in platforms_found:
+                # Try to find a parent link or data attribute
+                parent_link = element.find_parent('a')
+                if parent_link and parent_link.get('href'):
+                    href = parent_link.get('href')
+                    if 'facebook.com' in href.lower():
+                        platforms_found["Facebook"] = href
+
+        elif any(social in classes for social in ['fa-instagram', 'instagram', 'ig-', 'icon-instagram']):
+            if "Instagram" not in platforms_found:
+                parent_link = element.find_parent('a')
+                if parent_link and parent_link.get('href'):
+                    href = parent_link.get('href')
+                    if 'instagram.com' in href.lower():
+                        platforms_found["Instagram"] = href
+
+    # Format results
+    platform_list = list(platforms_found.keys())
+
+    if len(platform_list) == 4:
+        summary = "Facebook, Instagram, Twitter, Yelp"
+    elif len(platform_list) >= 3:
+        summary = ", ".join(platform_list)
+    elif len(platform_list) == 2:
+        summary = ", ".join(platform_list)
+    elif len(platform_list) == 1:
+        summary = platform_list[0]
+    else:
+        summary = "None"
+
+    return {
+        "platforms": platform_list,
+        "links": platforms_found,
+        "summary": summary
+    }
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def comprehensive_llm_analysis(_soup: BeautifulSoup, website_url: str, practice_name: str, reviews: list):
+    """Single comprehensive LLM analysis to avoid multiple API calls"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and _soup):
+        return None
+
+    # Use URL as cache key with hash for better memory management
+    cache_key = hashlib.md5(f"{website_url}_{practice_name}_{len(reviews or [])}".encode()).hexdigest()
+
+    # Check advanced cache first
+    cached_result = _advanced_cache.get(cache_key)
+    if cached_result:
+        return cached_result
+
+    try:
+        # Prepare all data for single analysis
+        page_text = _soup.get_text(" ", strip=True)[:2500]  # Reduced limit
+        links = [a.get("href") or "" for a in _soup.find_all("a", href=True)]
+
+        # Filter social media links - be more comprehensive
+        social_platforms = ["facebook", "instagram", "twitter", "x.com", "yelp", "fb.com", "ig.com"]
+        social_links = [l for l in links[:50] if any(platform in l.lower() for platform in social_platforms)]
+
+        # Also search for social media mentions in text
+        social_text_mentions = []
+        for platform in ["Facebook", "Instagram", "Twitter", "Yelp"]:
+            if platform.lower() in page_text.lower():
+                social_text_mentions.append(f"'{platform}' mentioned in text")
+
+        if social_text_mentions:
+            social_links.extend(social_text_mentions)
+
+        # Basic counts
+        img_count = len(_soup.find_all("img"))
+        vid_count = len(_soup.find_all(["video", "source"]))
+
+        # Review text (limit to prevent timeout)
+        review_texts = []
+        for review in (reviews or [])[:5]:  # Reduced to 5 reviews
+            text = review.get("text", "").strip()
+            if text:
+                review_texts.append(text[:200])  # Limit each review text
+
+        reviews_context = " | ".join(review_texts) if review_texts else "No reviews available"
+
+        # Single comprehensive prompt
+        prompt = f"""
+        You are an expert Online Marketing professional specializing in dental practices. Analyze this dental practice website comprehensively and return a JSON response with actionable marketing insights:
+
+        Practice: {practice_name or "Dental Practice"}
+        Website: {website_url}
+        Content: {page_text[:800]}...
+
+        Social Media Links Found: {social_links[:5]}
+        Visual Content: {img_count} images, {vid_count} videos
+        Sample Reviews: {reviews_context[:500]}
+
+        Return JSON with ALL sections:
+        {{
+            "social_media": {{
+                "platforms": ["Facebook", "Instagram", "Twitter", "Yelp"],
+                "links": {{"Facebook": "url_or_null", "Instagram": "url_or_null", "Twitter": "url_or_null", "Yelp": "url_or_null"}},
+                "advice": "Brief social media strategy advice",
+                "visibility_insights": "• Implement local SEO with city + dentist keywords\\n• Create Google My Business posts weekly\\n• Build local directory citations"
+            }},
+            "reputation": {{
+                "sentiment": "Overall review sentiment summary",
+                "positive_themes": "Top positive themes (comma-separated)",
+                "negative_themes": "Top negative themes or 'None detected'",
+                "advice": "Brief reputation management advice"
+            }},
+            "marketing": {{
+                "content_quality": "Website content assessment",
+                "visual_effectiveness": "Photo/video marketing assessment",
+                "key_recommendations": "Top 3 marketing improvements",
+                "advertising_advice": "Marketing tools recommendation"
+            }}
+        }}
+
+        CRITICAL REQUIREMENTS:
+        1. For visibility_insights: Provide exactly 3 actionable bullet points formatted as "• Point 1\\n• Point 2\\n• Point 3"
+        2. Each bullet point should be specific, actionable advice a dental practice can implement immediately
+        3. Focus on: local SEO, Google My Business, online directories, website optimization, social media presence
+        4. Act as an expert marketing consultant - give professional, practical advice
+        5. Keep bullet points under 60 characters each for clear display
+
+        For social media links, only include actual practice profile URLs, not general pages or sharing widgets.
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        # Parse response
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        result = json.loads(json_text)
+
+        # Store in advanced cache
+        _advanced_cache.put(cache_key, result)
+
+        return result
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Comprehensive LLM analysis failed: {str(e)[:100]}")
+        return None
+
+# Async LLM processing for improved performance
+async def async_llm_call(prompt: str, model_name: str = 'claude-3-haiku-20240307'):
+    """Async wrapper for LLM API calls"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return None
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Run the blocking LLM call in a thread pool
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            response = await loop.run_in_executor(executor, call_claude_api, prompt, model_name)
+            return response
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Async LLM call failed: {str(e)[:100]}")
+        return None
+
+async def batch_llm_analysis(prompts_dict: dict):
+    """Process multiple LLM prompts concurrently"""
+    if not prompts_dict:
+        return {}
+
+    # Create async tasks for all prompts
+    tasks = {}
+    for key, prompt in prompts_dict.items():
+        tasks[key] = asyncio.create_task(async_llm_call(prompt))
+
+    # Wait for all tasks to complete
+    results = {}
+    for key, task in tasks.items():
+        try:
+            results[key] = await task
+        except Exception as e:
+            st.sidebar.write(f"⚠️ Batch analysis failed for {key}: {str(e)[:50]}")
+            results[key] = None
+
+    return results
+
+def run_async_llm_analysis(prompts_dict: dict):
+    """Synchronous wrapper for async batch processing"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(batch_llm_analysis(prompts_dict))
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Async analysis wrapper failed: {str(e)[:100]}")
+        return {}
+    finally:
+        loop.close()
+
+# Streaming and progress support
+def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews):
+    """Stream LLM analysis with real-time progress updates"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    # Create progress container
+    progress_container = st.empty()
+    status_container = st.empty()
+    start_time = time.time()
+
+    try:
+        # Step 1: Check cache
+        progress_container.progress(10, "Checking cache...")
+        cache_key = hashlib.md5(f"{website_url}_{practice_name}_{len(reviews or [])}".encode()).hexdigest()
+        cached_result = _advanced_cache.get(cache_key)
+        if cached_result:
+            progress_container.progress(100, "Analysis complete (cached)")
+            time.sleep(0.5)  # Brief display
+            progress_container.empty()
+            status_container.empty()
+            return cached_result
+
+        # Step 2: Data preparation
+        progress_container.progress(25, "Preparing data...")
+        page_text = soup.get_text(" ", strip=True)[:2500]
+        links = [a.get("href") or "" for a in soup.find_all("a", href=True)]
+        social_links = [l for l in links[:30] if any(platform in l.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])]
+
+        # Step 3: Content analysis
+        progress_container.progress(40, "Analyzing content...")
+        img_count = len(soup.find_all("img"))
+        vid_count = len(soup.find_all(["video", "source"]))
+
+        # Step 4: Review processing
+        progress_container.progress(55, "Processing reviews...")
+        review_texts = []
+        for review in (reviews or [])[:5]:
+            text = review.get("text", "").strip()
+            if text:
+                review_texts.append(text[:200])
+        reviews_context = " | ".join(review_texts) if review_texts else "No reviews available"
+
+        # Step 5: LLM Analysis
+        progress_container.progress(70, "Running AI analysis...")
+
+        # Create comprehensive prompt
+        prompt = f"""
+        You are an expert Online Marketing professional specializing in dental practices. Analyze this dental practice website comprehensively and return a JSON response with actionable marketing insights:
+
+        Practice: {practice_name or "Dental Practice"}
+        Website: {website_url}
+        Content: {page_text[:800]}...
+
+        Social Media Links Found: {social_links[:5]}
+        Visual Content: {img_count} images, {vid_count} videos
+        Sample Reviews: {reviews_context[:500]}
+
+        Return JSON with ALL sections:
+        {{
+            "social_media": {{
+                "platforms": ["Facebook", "Instagram", "Twitter", "Yelp"],
+                "links": {{"Facebook": "url_or_null", "Instagram": "url_or_null", "Twitter": "url_or_null", "Yelp": "url_or_null"}},
+                "advice": "Brief social media strategy advice",
+                "visibility_insights": "• Implement local SEO with city + dentist keywords\\n• Create Google My Business posts weekly\\n• Build local directory citations"
+            }},
+            "reputation": {{
+                "sentiment": "Overall review sentiment summary",
+                "positive_themes": "Top positive themes (comma-separated)",
+                "negative_themes": "Top negative themes or 'None detected'",
+                "advice": "Brief reputation management advice"
+            }},
+            "marketing": {{
+                "content_quality": "Website content assessment",
+                "visual_effectiveness": "Photo/video marketing assessment",
+                "key_recommendations": "Top 3 marketing improvements",
+                "advertising_advice": "Marketing tools recommendation"
+            }}
+        }}
+
+        CRITICAL REQUIREMENTS:
+        1. For visibility_insights: Provide exactly 3 actionable bullet points formatted as "• Point 1\\n• Point 2\\n• Point 3"
+        2. Each bullet point should be specific, actionable advice a dental practice can implement immediately
+        3. Focus on: local SEO, Google My Business, online directories, website optimization, social media presence
+        4. Act as an expert marketing consultant - give professional, practical advice
+        5. Keep bullet points under 60 characters each for clear display
+
+        For social media links, only include actual practice profile URLs, not general pages or sharing widgets.
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        # Step 6: Processing results
+        progress_container.progress(90, "Processing results...")
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        result = json.loads(json_text)
+
+        # Step 7: Caching
+        progress_container.progress(95, "Caching results...")
+        _advanced_cache.put(cache_key, result)
+
+        # Complete
+        elapsed_time = time.time() - start_time
+        progress_container.progress(100, f"Analysis complete! ({elapsed_time:.1f}s)")
+        time.sleep(1.0)  # Show completion message briefly
+        progress_container.empty()
+        status_container.empty()
+
+        # Log performance for monitoring
+        if elapsed_time > 30:  # Alert if analysis takes too long
+            st.sidebar.warning(f"⚡ LLM analysis took {elapsed_time:.1f}s - consider optimization")
+
+        return result
+
+    except Exception as e:
+        progress_container.empty()
+        status_container.error(f"AI analysis failed: {str(e)[:100]}")
+        time.sleep(2.0)  # Show error briefly
+        status_container.empty()
+        return None
+
+def extract_social_media_with_llm(links, soup):
+    """Use Claude AI to identify social media profile links"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return None
+
+    try:
+        # Prepare context for LLM
+        page_text = soup.get_text(" ", strip=True)[:2000]  # Limit context
+        links_text = "\n".join([f"- {link}" for link in links[:50] if any(platform in link.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])])
+
+        if not links_text:
+            return None
+
+        prompt = f"""
+        Analyze this dental practice website content and identify OFFICIAL social media profile links.
+
+        Website context: {page_text[:500]}...
+
+        Potential social media links found:
+        {links_text}
+
+        For each link, determine if it's an OFFICIAL profile for this dental practice (not ads, general pages, or unrelated profiles).
+
+        Return ONLY a JSON object with this exact format:
+        {{
+            "links": {{
+                "Facebook": "actual_facebook_url_or_null",
+                "Instagram": "actual_instagram_url_or_null",
+                "Twitter": "actual_twitter_url_or_null",
+                "Yelp": "actual_yelp_url_or_null"
+            }}
+        }}
+
+        Rules:
+        - Only include URLs that are clearly official practice profiles
+        - Use null for platforms with no official presence
+        - Yelp business pages count as official presence
+        - Personal profiles or general company pages don't count
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        # Parse LLM response
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        result = json.loads(json_text)
+        return result
+
+    except Exception as e:
+        st.sidebar.write(f"LLM extraction error: {str(e)[:100]}")
+        return None
+
+def analyze_marketing_signals_with_llm(_soup: BeautifulSoup, website_url: str, practice_name: str = ""):
+    """Enhanced marketing analysis using Claude AI"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and _soup):
+        return None
+
+    try:
+        # Extract website content and marketing elements
+        page_text = _soup.get_text(" ", strip=True)[:3000]  # Limit context
+        html_content = str(_soup)[:5000]  # Limited HTML for analysis
+
+        # Basic counts
+        img_count = len(_soup.find_all("img"))
+        vid_count = len(_soup.find_all(["video", "source"]))
+
+        # Find marketing-related elements
+        scripts = [script.get("src", "") for script in _soup.find_all("script", src=True)]
+        meta_tags = [meta.get("name", "") + ":" + meta.get("content", "") for meta in _soup.find_all("meta", attrs={"name": True, "content": True})]
+
+        prompt = f"""
+        Analyze this dental practice website for marketing effectiveness and provide actionable insights:
+
+        Practice: {practice_name or "Dental Practice"}
+        Website: {website_url}
+
+        Content Overview: {page_text[:1000]}...
+
+        Technical Elements:
+        - Images: {img_count}
+        - Videos: {vid_count}
+        - Script sources: {scripts[:10]}
+        - Meta tags: {meta_tags[:5]}
+
+        Analyze and return JSON with:
+        {{
+            "content_quality": "Assessment of website content effectiveness",
+            "visual_appeal": "Analysis of photos/videos and visual elements",
+            "seo_signals": "SEO optimization status and recommendations",
+            "conversion_optimization": "Assessment of call-to-actions and conversion elements",
+            "patient_engagement": "How well the site engages potential patients",
+            "marketing_tools": "Detected marketing/tracking tools analysis",
+            "key_recommendations": "Top 3 actionable marketing improvements"
+        }}
+
+        Focus on dental practice marketing best practices:
+        - Patient testimonials and before/after photos
+        - Clear call-to-actions (book appointment, call now)
+        - Trust signals (certifications, awards, team photos)
+        - Local SEO optimization
+        - Mobile-friendliness
+        - Service descriptions and benefits
+        - Contact information prominence
+        - Emergency dental care messaging
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        # Parse LLM response
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        result = json.loads(json_text)
+        return result
+
+    except Exception as e:
+        st.sidebar.write(f"LLM marketing analysis error: {str(e)[:100]}")
+        return None
+
+def media_count_from_site(_soup: BeautifulSoup):
+    """Enhanced media analysis with content quality assessment"""
+    if not _soup: return "Search limited"
+
+    imgs = _soup.find_all("img")
+    vids = _soup.find_all(["video","source"])
+
+    # Basic count
+    img_count = len(imgs)
+    vid_count = len(vids)
+
+    # Note: Visual content analysis moved to comprehensive_llm_analysis for performance
+
+    return f"{img_count} photos, {vid_count} videos"
+
+def advertising_signals(_soup: BeautifulSoup):
+    """Enhanced advertising and tracking analysis"""
+    if not _soup: return "Search limited"
+    html = str(_soup)
     sig = []
+
+    # Enhanced tracking detection
     if "gtag(" in html or "gtag.js" in html or "www.googletagmanager.com" in html:
-        sig.append("Google tag")
+        sig.append("Google Analytics/GTM")
     if "fbq(" in html:
         sig.append("Facebook Pixel")
-    return ", ".join(sig) if sig else "None detected"
+    if "google-site-verification" in html:
+        sig.append("Google Search Console")
+    if "linkedin.com/in" in html or "linkedin insight" in html.lower():
+        sig.append("LinkedIn Tracking")
+    if "_gaq" in html or "ga(" in html:
+        sig.append("Google Analytics (Legacy)")
+    if "hotjar" in html.lower():
+        sig.append("Hotjar")
+    if "intercom" in html.lower():
+        sig.append("Intercom Chat")
+    if "zendesk" in html.lower() or "zopim" in html.lower():
+        sig.append("Zendesk Chat")
+
+    detected_tools = ", ".join(sig) if sig else "None detected"
+
+    # Note: Marketing tools analysis moved to comprehensive_llm_analysis for performance
+
+    return detected_tools
 
 def appointment_booking_from_site(soup: BeautifulSoup):
     if not soup: return "Search limited"
@@ -501,10 +1518,83 @@ def insurance_from_site(soup: BeautifulSoup):
         return m.group(0) if m else "Mentioned on site"
     return "Unclear"
 
-# --- Sentiment/theme analysis (simple keyword approach on up to 5 Google reviews) ---
+# --- Enhanced LLM-based reputation analysis ---
 def analyze_review_texts(reviews):
+    """Enhanced review analysis using Claude AI with keyword fallback"""
     if not reviews:
         return "Search limited", "Search limited", "Search limited"
+
+    # Note: LLM analysis handled by comprehensive_llm_analysis for performance
+
+    # Fallback to keyword-based analysis
+    return analyze_reviews_with_keywords(reviews)
+
+def analyze_reviews_with_llm(reviews):
+    """Use Claude AI to analyze dental practice reviews"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and reviews):
+        return None
+
+    try:
+        # Prepare review texts (limit for context)
+        review_texts = []
+        for i, review in enumerate(reviews[:10]):  # Analyze up to 10 reviews
+            text = review.get("text", "").strip()
+            rating = review.get("rating", "")
+            author = review.get("author_name", "Anonymous")
+            if text:
+                review_texts.append(f"Review {i+1} ({rating}★ by {author}): {text}")
+
+        if not review_texts:
+            return None
+
+        reviews_context = "\n\n".join(review_texts)
+
+        prompt = f"""
+        Analyze these Google reviews for a dental practice and provide insights:
+
+        {reviews_context}
+
+        Please analyze and return a JSON response with:
+        {{
+            "sentiment": "Overall sentiment summary (1 line)",
+            "positive_themes": "Top 3 positive themes mentioned (comma-separated)",
+            "negative_themes": "Top 3 negative concerns mentioned (comma-separated, or 'None detected' if none)",
+            "key_insights": "2-3 key insights for practice improvement"
+        }}
+
+        Focus on dental practice specific themes like:
+        - Staff friendliness, professionalism
+        - Pain management, comfort
+        - Cleanliness, hygiene
+        - Wait times, scheduling
+        - Communication, explanations
+        - Billing, insurance issues
+        - Office environment
+        - Treatment quality
+
+        Keep responses concise and actionable.
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        # Parse LLM response
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        result = json.loads(json_text)
+        return result
+
+    except Exception as e:
+        st.sidebar.write(f"LLM review analysis error: {str(e)[:100]}")
+        return None
+
+def analyze_reviews_with_keywords(reviews):
+    """Fallback keyword-based review analysis"""
     text_blob = " ".join((rv.get("text") or "") for rv in reviews).lower()
     positive_themes = {
         "friendly staff": ["friendly","kind","caring","nice","welcoming","courteous"],
@@ -554,9 +1644,27 @@ def to_pct_from_score_str(s):
 def compute_smile_score(wh_pct, social_present, rating, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False):
     vis_parts = []
     if isinstance(wh_pct, (int,float)): vis_parts.append(wh_pct)
-    if social_present == "Facebook, Instagram": vis_parts.append(100)
-    elif social_present in ("Facebook","Instagram"): vis_parts.append(60)
-    else: vis_parts.append(0)
+
+    # New 4-platform scoring system
+    if isinstance(social_present, dict):
+        platforms = social_present.get("platforms", [])
+        platform_score = len(platforms) * 25  # 25 points per platform
+        vis_parts.append(min(platform_score, 100))
+    elif isinstance(social_present, str):
+        # Fallback for old format
+        if social_present == "Facebook, Instagram, Twitter, Yelp":
+            vis_parts.append(100)
+        elif "," in social_present and len(social_present.split(",")) >= 3:
+            vis_parts.append(75)
+        elif "," in social_present:
+            vis_parts.append(50)
+        elif social_present not in ("None", ""):
+            vis_parts.append(25)
+        else:
+            vis_parts.append(0)
+    else:
+        vis_parts.append(0)
+
     vis_avg = sum(vis_parts)/len(vis_parts) if vis_parts else 0
     vis_score = (vis_avg/100)*30
 
@@ -603,10 +1711,149 @@ def advise(metric, value):
     if "search visibility" in metric.lower():
         return "You nailed it" if "yes" in s else "Improve local SEO & citations"
 
+    if "ai insights" in metric.lower():
+        return "AI-generated recommendations based on website analysis"
+
     if "social media presence" in metric.lower():
-        if "facebook, instagram" in s: return "You nailed it"
-        if "facebook" in s or "instagram" in s: return "Add the other platform & post weekly"
-        return "Add FB/IG links; post 2–3×/week"
+        # Try LLM-based advice first
+        llm_advice = generate_social_media_advice_with_llm(value)
+        if llm_advice:
+            return llm_advice
+
+        # Fallback to rule-based advice
+        if isinstance(value, dict):
+            platforms = value.get("platforms", [])
+            if len(platforms) >= 4: return "You nailed it - excellent social presence!"
+            elif len(platforms) == 3: return "Great start! Add remaining platform for complete coverage"
+            elif len(platforms) == 2: return "Good foundation. Add 2 more platforms and post regularly"
+            elif len(platforms) == 1: return "Expand to Facebook, Instagram, Twitter & Yelp"
+            else: return "Create profiles on Facebook, Instagram, Twitter & Yelp"
+        else:
+            # Old string format fallback
+            if "facebook, instagram, twitter, yelp" in s.lower(): return "You nailed it"
+            if len([p for p in ["facebook", "instagram", "twitter", "yelp"] if p in s.lower()]) >= 3: return "Almost there! Add missing platform"
+            if "facebook" in s or "instagram" in s: return "Add other platforms & post weekly"
+            return "Add FB/IG/Twitter/Yelp links; post 2–3×/week"
+
+def format_social_media_with_links(social_data):
+    """Format social media presence with hyperlinks for display in reports"""
+    if not isinstance(social_data, dict):
+        return str(social_data)
+
+    platforms = social_data.get("platforms", [])
+    links = social_data.get("links", {})
+
+    if not platforms:
+        return "None"
+
+    # Create linked platform names
+    linked_platforms = []
+    for platform in platforms:
+        link = links.get(platform)
+        if link and link != "null":  # LLM might return "null" string
+            # Clean the link - ensure it's a proper URL
+            clean_link = link.strip()
+            if not clean_link.startswith(('http://', 'https://')):
+                clean_link = 'https://' + clean_link
+            linked_platforms.append(f'<a href="{escape(clean_link)}" target="_blank" rel="noopener">{escape(platform)}</a>')
+        else:
+            linked_platforms.append(escape(platform))
+
+    return ", ".join(linked_platforms)
+
+def generate_social_media_advice_with_llm(social_data):
+    """Generate personalized social media advice using Claude"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return None
+
+    try:
+        if isinstance(social_data, dict):
+            platforms = social_data.get("platforms", [])
+            links = social_data.get("links", {})
+        else:
+            # Fallback for string format
+            platforms = [p.strip() for p in str(social_data).split(",") if p.strip() != "None"]
+            links = {}
+
+        platform_count = len(platforms)
+        missing_platforms = [p for p in ["Facebook", "Instagram", "Twitter", "Yelp"] if p not in platforms]
+
+        prompt = f"""
+        Generate concise social media advice for a dental practice with current presence on: {platforms if platforms else "no platforms"}.
+
+        Missing platforms: {missing_platforms}
+
+        Provide a brief, actionable recommendation (max 15 words) focusing on:
+        - Which platforms to prioritize next
+        - Content strategy hints
+        - Patient engagement tips
+
+        Make it dental practice specific and professional.
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        advice = response_text.strip()
+        # Clean up the response
+        if len(advice) > 100:  # Truncate if too long
+            advice = advice[:97] + "..."
+
+        return advice
+
+    except Exception as e:
+        return None  # Fallback to rule-based advice
+
+def generate_reputation_advice_with_llm(advice_type, value):
+    """Generate LLM-powered reputation management advice"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return None
+
+    try:
+        if advice_type == "sentiment":
+            prompt = f"""
+            A dental practice has this reputation sentiment: "{value}"
+
+            Generate a concise, actionable recommendation (max 12 words) for improving their online reputation.
+            Focus on practical steps they can take immediately.
+            """
+
+        elif advice_type == "positive":
+            if "none detected" in str(value).lower():
+                return None  # Use fallback
+            prompt = f"""
+            A dental practice has these positive review themes: "{value}"
+
+            Generate a brief marketing suggestion (max 12 words) on how to amplify these strengths.
+            Focus on leveraging these positives for growth.
+            """
+
+        elif advice_type == "negative":
+            if "none detected" in str(value).lower():
+                return "You nailed it - maintain current quality standards"
+            prompt = f"""
+            A dental practice has these negative review concerns: "{value}"
+
+            Generate a specific action plan (max 12 words) to address these issues.
+            Focus on operational improvements and patient satisfaction.
+            """
+        else:
+            return None
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        advice = response_text.strip()
+        # Clean and truncate if needed
+        if len(advice) > 80:
+            advice = advice[:77] + "..."
+
+        return advice
+
+    except Exception as e:
+        return None  # Fallback to rule-based advice
 
     if "google reviews (avg)" in metric.lower():
         try:
@@ -634,14 +1881,28 @@ def advise(metric, value):
         return "You nailed it" if ("unclear" not in s) else "Publish accepted plans on site & GBP"
 
     if "sentiment highlights" in metric.lower():
+        # Try LLM-based reputation advice
+        llm_advice = generate_reputation_advice_with_llm("sentiment", value)
+        if llm_advice:
+            return llm_advice
+
+        # Fallback to rule-based advice
         if "mostly positive" in s: return "You nailed it"
         if "mixed" in s: return "Fix top negatives & reply to reviews"
         return "Reply to negative themes with solutions"
 
     if "top positive themes" in metric.lower():
+        llm_advice = generate_reputation_advice_with_llm("positive", value)
+        if llm_advice:
+            return llm_advice
         return "Amplify these themes on website & ads" if ("none detected" not in s) else ""
 
     if "top negative themes" in metric.lower():
+        llm_advice = generate_reputation_advice_with_llm("negative", value)
+        if llm_advice:
+            return llm_advice
+
+        # Fallback to rule-based advice
         if "none detected" in s: return "You nailed it"
         if "long wait" in s: return "Stagger scheduling & add SMS reminders"
         if "billing" in s: return "Clarify estimates & billing SOP"
@@ -649,12 +1910,80 @@ def advise(metric, value):
         return "Tackle top 1–2 negative themes this month"
 
     if "photos" in metric.lower():
+        # Enhanced photo/video advice
+        llm_advice = generate_marketing_advice_with_llm("visual_content", value)
+        if llm_advice:
+            return llm_advice
         return "You nailed it" if ("none" not in s and "0" not in s) else "Upload 10–20 clinic & team photos"
 
     if "advertising scripts" in metric.lower():
+        # Try LLM-based marketing advice
+        llm_advice = generate_marketing_advice_with_llm("advertising", value)
+        if llm_advice:
+            return llm_advice
         return "You nailed it" if ("none" not in s) else "Add GA4/Ads pixel for conversion tracking"
 
     return ""
+
+def generate_marketing_advice_with_llm(advice_type, value):
+    """Generate LLM-powered marketing advice"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return None
+
+    try:
+        if advice_type == "visual_content":
+            prompt = f"""
+            A dental practice website has: "{value}"
+
+            Generate brief visual content marketing advice (max 12 words) focusing on:
+            - Professional photography needs
+            - Patient trust building through visuals
+            - Before/after content opportunities
+            """
+
+        elif advice_type == "advertising":
+            if "none detected" in str(value).lower():
+                prompt = f"""
+                A dental practice has no marketing tracking tools detected.
+
+                Suggest essential marketing tools (max 12 words) for patient acquisition:
+                - Which tracking pixels are most important?
+                - What should they implement first?
+                """
+            else:
+                prompt = f"""
+                A dental practice uses these marketing tools: "{value}"
+
+                Provide optimization advice (max 12 words) for better patient acquisition:
+                - Are they missing key tools?
+                - How to improve conversion tracking?
+                """
+
+        elif advice_type == "content_strategy":
+            prompt = f"""
+            A dental practice website shows: "{value}"
+
+            Generate content marketing strategy advice (max 12 words) focusing on:
+            - Patient education content
+            - Trust building elements
+            - Local SEO opportunities
+            """
+        else:
+            return None
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return None
+
+        advice = response_text.strip()
+        # Clean and truncate if needed
+        if len(advice) > 80:
+            advice = advice[:77] + "..."
+
+        return advice
+
+    except Exception as e:
+        return None  # Fallback to rule-based advice
 
 def _normalize_url(u: str) -> str:
     if not u: return u
@@ -687,7 +2016,7 @@ def _get_gs_worksheet():
 
 def append_submission_to_sheet(data: dict) -> bool:
     """
-    Appends a single row with the five requested fields.
+    Appends a single row with the six requested fields.
     Returns True on success, False otherwise. Never raises to the UI.
     """
     ws = _get_gs_worksheet()
@@ -698,6 +2027,7 @@ def append_submission_to_sheet(data: dict) -> bool:
 
     row = [
         data.get("website", ""),
+        data.get("doctor_name", ""),
         data.get("email", ""),
         data.get("phone", ""),
         data.get("practice_name", ""),
@@ -715,10 +2045,20 @@ def append_submission_to_sheet(data: dict) -> bool:
 
 def build_static_report_html(final, overview, visibility, reputation, marketing, experience, scores, reviews):
     def _kv_table(title, d):
-        rows = "".join(
-            f"<tr><th>{k}</th><td>{escape(str(v)) if isinstance(v,str) else escape(json.dumps(v)) if v else '—'}</td></tr>"
-            for k, v in d.items()
-        )
+        rows = ""
+        for k, v in d.items():
+            # Special handling for Social Media Presence to preserve HTML links
+            if k == "Social Media Presence" and isinstance(v, str) and "<a href=" in v:
+                cell_content = v  # Don't escape HTML links
+            elif isinstance(v, str):
+                cell_content = escape(v)
+            elif v:
+                cell_content = escape(json.dumps(v))
+            else:
+                cell_content = "—"
+
+            rows += f"<tr><th>{escape(k)}</th><td>{cell_content}</td></tr>"
+
         return f"<section><h2>{title}</h2><table>{rows}</table></section>"
 
     email = final.get('email', '')
@@ -752,6 +2092,7 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
       <h1>Face Value Audit Report</h1>
       <h2>{escape(title)}</h2>
       <div class="header-info">
+        <strong>Doctor:</strong> {escape(final.get('doctor_name','—'))} &nbsp;|&nbsp;
         <strong>Website:</strong> {escape(final.get('website','—'))} &nbsp;|&nbsp;
         <strong>Email:</strong> {escape(final.get('email','—'))} &nbsp;|&nbsp;
         <strong>Phone:</strong> {escape(final.get('phone','—'))}<br>
@@ -830,107 +2171,172 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
 
 
 
-# ---- two-column layout ----
-col_left, col_right = st.columns([1, 1], gap="large")
+# ---- Single form layout ----
+st.subheader("Enter Practice Details")
 
-# ---------- LEFT: Basic inputs + Generate button ----------
-with col_left:
-    st.subheader("Step 1 · Enter below details")
+# All inputs outside the form for real-time updates and prefill functionality
 
-    # read existing draft defaults if any
-    website = st.text_input(
-        "Website Link *",
-        key="website_input",
-        value=st.session_state.draft.get("website", "")
-    )
-    email = st.text_input(
-        "Email ID *",
-        key="email_input",
-        value=st.session_state.draft.get("email", "")
-    )
-    phone = st.text_input(
-        "Phone Number *",
-        key="phone_input",
-        value=st.session_state.draft.get("phone", "")
-    )
+# 1. Website URL
+website = st.text_input(
+    "Website URL *",
+    key="website_input",
+    value=st.session_state.draft.get("website", ""),
+    placeholder="https://example.com"
+)
 
-    # persist user entries into draft continuously
-    st.session_state.draft["website"] = website
-    st.session_state.draft["email"] = email
-    st.session_state.draft["phone"] = phone
+# Auto-prefill functionality when website URL changes
+if website and website != st.session_state.get("last_prefill_website", ""):
+    normalized_website = _normalize_url(website)
+    if normalized_website and normalized_website != st.session_state.get("last_prefill_website", ""):
+        st.session_state.last_prefill_website = normalized_website
+        with st.spinner("Fetching practice details from website..."):
+            prefill_from_website(normalized_website)
+            st.session_state.last_fetched_website = normalized_website
+            st.rerun()
 
-    # validation
-    url_ok   = bool(_normalize_url(website))
-    email_ok = _valid_email(email)
-    phone_ok = _valid_phone(phone)
-    ready    = url_ok and email_ok and phone_ok
+# 2. Contact Person/ Name of the Doctor
+doctor_name = st.text_input(
+    "Contact Person/ Name of the Doctor *",
+    key="doctor_name_input",
+    value=st.session_state.draft.get("doctor_name", ""),
+    placeholder="Dr. John Smith"
+)
 
+# 3. Email ID (with prefill messages)
+email_value = st.session_state.draft.get("email", "")
+email_message = st.session_state.draft.get("email_message", "")
+
+email = st.text_input(
+    "Email ID *",
+    value=email_value,
+    key="email_input",
+    placeholder="contact@example.com"
+)
+
+if email_value and not email_message:
+    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
+elif email_message:
+    st.caption(f"ℹ️ {email_message}")
+
+# 4. Phone Number (with prefill messages)
+phone_value = st.session_state.draft.get("phone", "")
+phone_message = st.session_state.draft.get("phone_message", "")
+
+phone = st.text_input(
+    "Phone Number *",
+    value=phone_value,
+    key="phone_input",
+    placeholder="+1-555-123-4567"
+)
+
+if phone_value and not phone_message:
+    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
+elif phone_message:
+    st.caption(f"ℹ️ {phone_message}")
+
+# 5. Practice's Name (with prefill messages)
+practice_name_value = st.session_state.draft.get("practice_name", "")
+name_message = st.session_state.draft.get("name_message", "")
+
+practice_name = st.text_input(
+    "Practice's Name *",
+    value=practice_name_value,
+    key="practice_name_input",
+    placeholder="Smith Family Dentistry"
+)
+
+if practice_name_value and not name_message:
+    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
+elif name_message:
+    st.caption(f"ℹ️ {name_message}")
+
+# 6. Full Address (with prefill messages)
+address_value = st.session_state.draft.get("address", "")
+address_message = st.session_state.draft.get("address_message", "")
+
+address = st.text_area(
+    "Full Address *",
+    value=address_value,
+    height=80,
+    key="address_input",
+    placeholder="123 Main Street, City, State, ZIP Code"
+)
+
+if address_value and not address_message:
+    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
+elif address_message:
+    st.caption(f"ℹ️ {address_message}")
+
+# Show helpful tip for blocked websites
+if (st.session_state.get("last_fetch_error") == "blocked" and
+    not practice_name_value and not address_value):
+    st.info("💡 **Tip**: Some websites block automated access for security. Please manually enter the practice name and address from the website.")
+
+# Persist user entries into draft continuously
+st.session_state.draft.update({
+    "website": website,
+    "doctor_name": doctor_name,
+    "email": email,
+    "phone": phone,
+    "practice_name": practice_name,
+    "address": address
+})
+
+# Validation
+url_ok = bool(_normalize_url(website))
+email_ok = _valid_email(email)
+phone_ok = _valid_phone(phone)
+doctor_ok = bool(doctor_name.strip())
+practice_ok = bool(practice_name.strip())
+address_ok = bool(address.strip())
+
+ready = url_ok and email_ok and phone_ok and doctor_ok and practice_ok and address_ok
+
+# Show validation messages
+col1, col2 = st.columns(2)
+with col1:
     if website and not url_ok:
-        st.caption("⚠️ Please include a valid URL (we’ll add https:// if missing).")
+        st.caption("⚠️ Please include a valid URL (we'll add https:// if missing).")
     if email and not email_ok:
-        st.caption("⚠️ That email doesn’t look valid.")
+        st.caption("⚠️ That email doesn't look valid.")
     if phone and not phone_ok:
         st.caption("⚠️ Please include a valid phone number (at least 7 digits).")
 
-    # explicit prefill trigger (only when all three are valid)
-    if st.button("🔎 Generate Prefilled Form", use_container_width=True, disabled=not ready):
-        w = _normalize_url(website)
-        st.session_state.draft["website"] = w
-        with st.spinner("Fetching details from website…"):
-            prefill_from_website(w)  # your existing helper
-            st.session_state.last_fetched_website = w
+with col2:
+    if doctor_name and not doctor_ok:
+        st.caption("⚠️ Doctor name is required.")
+    if practice_name and not practice_ok:
+        st.caption("⚠️ Practice name is required.")
+    if address and not address_ok:
+        st.caption("⚠️ Full address is required.")
 
-# ------ has we actually prefetched for this exact website? ------
-has_prefill = (
-    st.session_state.draft.get("website")
-    and st.session_state.draft.get("website") == st.session_state.last_fetched_website
-    and (st.session_state.draft.get("practice_name") or st.session_state.draft.get("address"))
-)
+# Form with only the submit button
+with st.form("practice_details_form", clear_on_submit=False):
+    # Submit button
+    confirmed = st.form_submit_button("✅ Run Audit", use_container_width=True, disabled=not ready)
 
-# ---------- RIGHT: Prefilled editable form + Confirm button ----------
-with col_right:
-    st.subheader("Step 2 · Review & Confirm")
+    if confirmed:
+        maps_link = st.session_state.draft.get("maps_link", "")
+        normalized_website = _normalize_url(website)
+        st.session_state.final = {
+            "website": normalized_website,
+            "doctor_name": doctor_name,
+            "email": email,
+            "phone": phone,
+            "practice_name": practice_name,
+            "address": address,
+            "maps_link": maps_link,
+        }
 
-    if ready and has_prefill:
-        st.info("Review the auto-filled details below. You can edit before submitting.")
+        # 👉 append to Google Sheet BEFORE audit begins
+        saved = append_submission_to_sheet(st.session_state.final)
+        if saved:
+            st.toast("Saved to Google Sheet ✅")
 
-        # form lives in the right column
-        with st.form("review_confirm_form", clear_on_submit=False):
-            # distinct keys so they don't clash with left inputs
-            name = st.text_input(
-                "Practice Name",
-                st.session_state.draft.get("practice_name", ""),
-                key="review_practice_name"
-            )
-            addr = st.text_area(
-                "Address",
-                st.session_state.draft.get("address", ""),
-                height=80,
-                key="review_address"
-            )
+        # now proceed with your existing flow
+        st.session_state.submitted = True
+        st.rerun()  # safe on modern Streamlit; or call your _safe_rerun()
 
-            confirmed = st.form_submit_button("✅ Confirm & Run Audit", use_container_width=True, disabled=not ready)
-            if confirmed:
-                maps_link = st.session_state.draft.get("maps_link", "")
-                st.session_state.final = {
-                    "website": st.session_state.draft["website"],
-                    "email":   st.session_state.draft["email"],
-                    "phone":   st.session_state.draft["phone"],
-                    "practice_name": name,
-                    "address": addr,
-                    "maps_link": maps_link,
-                }
-                
-                # 👉 append to Google Sheet BEFORE audit begins
-                saved = append_submission_to_sheet(st.session_state.final)
-                if saved:
-                    st.toast("Saved to Google Sheet ✅")
-
-                # now proceed with your existing flow
-                st.session_state.submitted = True
-                st.rerun()  # safe on modern Streamlit; or call your _safe_rerun()
-    else:
-        st.info("Fill the three fields on the left and click **Generate Prefilled Form** to see the editable form here.")
 
 # Add custom Needle Tail footer
 st.markdown("---")
@@ -1033,10 +2439,20 @@ def show_visibility_cards(visibility: dict):
             if "no"  in s: return ("Not on Page 1", "badge-bad")
             return ("Unknown", "badge-muted")
         if "social media presence" in label.lower():
-            if "facebook, instagram" in s: return ("Both", "badge-ok")
-            if "facebook" in s or "instagram" in s: return ("Partial", "badge-warn")
-            if "none" in s: return ("None", "badge-bad")
-            return ("Unknown", "badge-muted")
+            # Handle new format - count platforms from HTML or platform count
+            platform_count = 0
+            if "<a href=" in s:  # Has hyperlinks (new format)
+                platform_count = s.count("<a href=")
+            elif "," in s:  # Comma-separated list
+                platform_count = len([p.strip() for p in s.split(",") if p.strip() and p.strip().lower() != "none"])
+            elif s.lower() not in ("none", "", "—"):
+                platform_count = 1
+
+            if platform_count >= 4: return ("All 4", "badge-ok")
+            elif platform_count == 3: return ("3 of 4", "badge-warn")
+            elif platform_count == 2: return ("2 of 4", "badge-warn")
+            elif platform_count == 1: return ("1 of 4", "badge-bad")
+            else: return ("None", "badge-bad")
         if "signals" in label.lower() or "checks" in label.lower():
             r = _ratio_from_checks(value)
             if r is None: return ("Unknown", "badge-muted")
@@ -1653,13 +3069,22 @@ if st.session_state.submitted:
     place_id = find_best_place_id(clinic_name, address, website)
     details = places_details(place_id) if place_id else None
 
-
+    
     final = st.session_state.final
 
     # Show processing message
-    st.info("🔄 Generating your comprehensive audit report...")
+    # st.info("🔄 Generating your comprehensive audit report...")
 
     with st.spinner("Analyzing your practice's online presence..."):
+
+        # Initialize comprehensive analysis with streaming progress
+        st.write("🤖 **AI Analysis in Progress**")
+        comprehensive_analysis = None
+        if HAS_CLAUDE and CLAUDE_API_KEY and soup:
+            try:
+                comprehensive_analysis = stream_llm_analysis_with_progress(soup, website, clinic_name, [])
+            except Exception as e:
+                st.warning(f"AI analysis unavailable: {str(e)[:100]}")
 
         # 1) Overview
         overview = {
@@ -1671,8 +3096,27 @@ if st.session_state.submitted:
 
         # 2) Visibility
         wh_str, wh_checks = website_health(website, soup, load_time)
-        social_present = social_presence_from_site(soup)
+        social_data = social_presence_from_site(soup)
+
+        # Enhance social data with LLM insights
+        if comprehensive_analysis and comprehensive_analysis.get("social_media"):
+            social_llm = comprehensive_analysis["social_media"]
+            if social_llm.get("links"):
+                # Merge LLM-detected links with existing data
+                if isinstance(social_data, dict):
+                    social_data["links"] = {**social_data.get("links", {}), **social_llm["links"]}
+                    social_data["platforms"] = list(set((social_data.get("platforms", []) + social_llm.get("platforms", []))))
+
         appears = appears_on_page1_for_dentist_near_me(website, clinic_name, address)
+
+        # Format social media display with hyperlinks
+        if isinstance(social_data, dict):
+            if social_data.get("links") or social_data.get("platforms"):
+                social_display = format_social_media_with_links(social_data)
+            else:
+                social_display = social_data.get("summary", "None")
+        else:
+            social_display = str(social_data)
 
         gbp_score = "Search limited"; gbp_signals = "Search limited"
         if details and details.get("status") == "OK":
@@ -1697,18 +3141,68 @@ if st.session_state.submitted:
             gbp_score = f"{min(score,100)}/100"
             gbp_signals = " | ".join(checks)
 
+        # Get AI insights for online visibility
+        visibility_ai_insights = ""
+        if comprehensive_analysis and comprehensive_analysis.get("social_media", {}).get("visibility_insights"):
+            insights = comprehensive_analysis["social_media"]["visibility_insights"]
+            # Format as bullet points for dataframe display
+            if isinstance(insights, str):
+                # Clean up the insights string and ensure proper bullet point formatting
+                insights = insights.strip()
+
+                # If insights already contain bullet points, use them directly
+                if "•" in insights and "\\n" in insights:
+                    # Replace escaped newlines with actual newlines
+                    visibility_ai_insights = insights.replace("\\n", "\n")
+                elif "•" in insights:
+                    # Split by bullet points and rejoin with newlines
+                    bullet_parts = insights.split("•")
+                    bullet_points = []
+                    for part in bullet_parts:
+                        part = part.strip()
+                        if part and len(part) > 5:
+                            bullet_points.append(f"• {part}")
+                    visibility_ai_insights = "\n".join(bullet_points[:3])
+                else:
+                    # Split by common delimiters and format as bullets
+                    bullet_points = []
+                    if "-" in insights:
+                        lines = insights.split("-")
+                    elif "." in insights:
+                        lines = insights.split(".")
+                    else:
+                        lines = [insights]
+
+                    for line in lines:
+                        line = line.strip()
+                        if line and len(line) > 5:  # Skip very short fragments
+                            bullet_points.append(f"• {line}")
+
+                    visibility_ai_insights = "\n".join(bullet_points[:3])  # Limit to 3 points
+
+                # Fallback to default insights if nothing was extracted
+                if not visibility_ai_insights.strip():
+                    visibility_ai_insights = "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
+
         visibility = {
             "GBP Completeness (estimate)": gbp_score,
             "GBP Signals": gbp_signals,
             "Search Visibility (Page 1?)": appears,
             "Website Health Score": wh_str,
             "Website Health Checks": wh_checks,
-            "Social Media Presence": social_present
+            "Social Media Presence": social_display,
+            "AI Insights": visibility_ai_insights if visibility_ai_insights else "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
         }
 
         # 3) Reputation
         rating_str, review_count_out, reviews = rating_and_reviews(details)
         sentiment_summary, top_pos_str, top_neg_str = analyze_review_texts(reviews)
+
+        # Get additional LLM insights from comprehensive analysis
+        key_insights = ""
+        if comprehensive_analysis and comprehensive_analysis.get("reputation"):
+            reputation_data = comprehensive_analysis["reputation"]
+            key_insights = reputation_data.get("advice", "") or reputation_data.get("sentiment", "")
 
         reputation = {
             "Google Reviews (Avg)": rating_str,
@@ -1718,12 +3212,26 @@ if st.session_state.submitted:
             "Top Negative Themes": top_neg_str,
         }
 
+        # Add key insights if available
+        if key_insights:
+            reputation["AI Insights"] = key_insights
+
         # 4) Marketing
+        # Get comprehensive LLM marketing analysis from cached result
+        marketing_insights = ""
+        if comprehensive_analysis and comprehensive_analysis.get("marketing"):
+            marketing_data = comprehensive_analysis["marketing"]
+            marketing_insights = marketing_data.get("key_recommendations", "") or marketing_data.get("advertising_advice", "")
+
         marketing = {
             "Photos/Videos on Website": media_count_from_site(soup) if soup else "Search limited",
             "Photos count in Google": photos_count_from_places(details) if details else "Search limited",
             "Advertising Scripts Detected": advertising_signals(soup) if soup else "Search limited",
         }
+
+        # Add LLM insights if available
+        if marketing_insights:
+            marketing["AI Marketing Insights"] = marketing_insights
 
         # 5) Experience
         booking = appointment_booking_from_site(soup)
@@ -1749,7 +3257,7 @@ if st.session_state.submitted:
         insurance_clear = isinstance(insurance, str) and insurance not in ["Search limited", "Unclear"]
 
         smile, vis_score, rep_score, exp_score = compute_smile_score(
-            wh_pct, social_present, rating_val, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False
+            wh_pct, social_data, rating_val, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False
         )
 
         # Build scores dictionary for report
