@@ -278,21 +278,6 @@ def _valid_phone(s: str) -> bool:
     # lenient; require at least 7 digits total
     return bool(re.search(r"\d{7,}", (s or "")))
 
-def extract_practice_name(soup: BeautifulSoup):
-    if not soup: 
-        return None
-    # Try common places: <h1>, title, og:site_name
-    h1 = soup.find("h1")
-    if h1 and h1.get_text(strip=True):
-        return h1.get_text(" ", strip=True)
-    title = soup.find("title")
-    if title and title.get_text(strip=True):
-        return title.get_text(" ", strip=True)
-    og = soup.find("meta", attrs={"property": "og:site_name"})
-    if og and og.get("content"):
-        return og["content"].strip()
-    return None
-
 def shorten_address(full_address: str) -> str:
     """
     Shorten a full address to be less descriptive while keeping essential info
@@ -367,62 +352,6 @@ def validate_address_with_geocoding(address: str) -> tuple[bool, str]:
         st.sidebar.write(f"⚠️ Address validation failed: {str(e)[:50]}")
         return False, address
 
-def extract_address_and_maplink(soup: BeautifulSoup):
-    if not soup:
-        return None, None
-
-    extracted_address = None
-    maps_link = None
-
-    # 1) direct Google Maps style links
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if any(k in href for k in ["google.com/maps", "goo.gl/maps", "maps.app.goo.gl", "g.page/"]):
-            text = a.get_text(" ", strip=True)
-            if text and not re.match(r"^https?://", text):
-                extracted_address = text
-                maps_link = href
-                break
-            maps_link = href
-
-    # 2) schema.org PostalAddress
-    if not extracted_address:
-        postal = soup.find(attrs={"itemtype": re.compile(r"schema\.org/PostalAddress", re.I)})
-        if postal:
-            parts = []
-            for key in ["streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"]:
-                el = postal.find(attrs={"itemprop": key})
-                if el:
-                    parts.append(el.get_text(" ", strip=True))
-            addr = ", ".join([p for p in parts if p])
-            if addr:
-                extracted_address = addr
-
-    # 3) Regex fallback (tune for your regions)
-    if not extracted_address:
-        text = soup.get_text("\n", strip=True)
-        m = re.search(
-            r"\d{1,6}\s+[^\n,]+(?:road|rd\.?|street|st\.?|ave|avenue|blvd|lane|ln|dr|drive|hwy|highway|pkwy|parkway|mall|suite|ste|floor|fl|#)[^\n]*",
-            text, flags=re.I
-        )
-        if m:
-            extracted_address = m.group(0).strip()
-
-    # If we found an address, shorten and validate it
-    if extracted_address:
-        # First shorten the address
-        shortened_address = shorten_address(extracted_address)
-
-        # Then validate and potentially get a better version
-        is_valid, validated_address = validate_address_with_geocoding(shortened_address)
-
-        if is_valid:
-            return validated_address, maps_link
-        else:
-            # If validation fails, don't return the address - only return the maps link
-            return None, maps_link
-
-    return None, None
 
 # LLM-powered extraction functions
 def extract_practice_name_with_llm(soup: BeautifulSoup, website_url: str):
@@ -442,14 +371,13 @@ def extract_practice_name_with_llm(soup: BeautifulSoup, website_url: str):
         Content: {page_text}
 
         Instructions:
-        - Find the official business/practice name (not doctor's personal name unless it's the practice name)
-        - Look for names like "Smith Dental", "Family Dentistry", "Dental Associates", etc.
-        - Ignore generic terms like "Dentist" or "Dental Services" alone
-        - Return ONLY the exact practice name as it appears, with no additional text or descriptions
-        - Do not add any descriptive words or explanations
-        - If no clear practice name exists, return "NOT_FOUND"
+        - Find the official business/practice name
+        - Return ONLY 3-4 words maximum (e.g., "Smith Family Dental", "Downtown Dentistry")
+        - Use proper title case
+        - Ignore generic terms like "Dentist" alone
+        - If no clear practice name, return "NOT_FOUND"
 
-        Practice Name:"""
+        Practice Name (3-4 words max):"""
 
         result = call_claude_api(prompt)
         if not result:
@@ -457,11 +385,13 @@ def extract_practice_name_with_llm(soup: BeautifulSoup, website_url: str):
 
         result = result.strip()
 
-        # Validate the result
-        if (result and result != "NOT_FOUND" and len(result) > 2 and len(result) < 100 and
-            not result.lower().startswith('http') and  # Not a URL
-            not result.lower() in ['dentist', 'dental', 'dental services', 'dental office']):  # Not generic terms
-            return result.title()  # Proper case formatting
+        # Validate the result - enforce 3-4 word limit
+        if (result and result != "NOT_FOUND" and
+            len(result) > 2 and len(result) < 50 and
+            len(result.split()) <= 4 and  # Maximum 4 words
+            not result.lower().startswith('http') and
+            not result.lower() in ['dentist', 'dental', 'dental services', 'dental office']):
+            return result.title()
 
         return None
 
@@ -760,27 +690,98 @@ def extract_insurance_info_with_llm(soup: BeautifulSoup, website_url: str):
         st.sidebar.write(f"⚠️ LLM insurance extraction failed: {str(e)[:50]}")
         return None
 
+def guess_practice_name_from_url_with_llm(website_url: str, soup: BeautifulSoup):
+    """Guess practice name from URL and validate with LLM (max 3-4 words)"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and website_url):
+        return ""
+
+    try:
+        # Extract potential name from URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(website_url.lower())
+        domain = parsed_url.netloc.replace('www.', '')
+        domain_parts = domain.split('.')[0]  # Get main part before .com/.net etc
+
+        # Common words to remove from domain
+        common_words = ['dental', 'dentist', 'clinic', 'practice', 'center', 'office', 'care', 'health', 'medical', 'smile', 'teeth', 'oral']
+
+        # Create URL-based guess
+        url_guess = domain_parts.replace('-', ' ').replace('_', ' ')
+        for word in common_words:
+            url_guess = url_guess.replace(word, '')
+        url_guess = ' '.join(url_guess.split()).title()  # Clean and title case
+
+        # Get website content for LLM validation
+        page_text = soup.get_text(" ", strip=True)[:1500] if soup else ""
+
+        prompt = f"""
+        Guess and validate the dental practice name from this URL and website content.
+
+        URL: {website_url}
+        Domain guess: {url_guess}
+        Website content: {page_text}
+
+        Instructions:
+        - Use the URL domain to guess the practice name
+        - Validate the guess against website content
+        - Return ONLY the practice name (3-4 words maximum)
+        - Use proper title case (e.g., "Smith Family Dentistry")
+        - If the URL guess doesn't match website content, use content instead
+        - If unclear, return "NOT_FOUND"
+
+        Practice Name:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return ""
+
+        result = result.strip()
+
+        # Validate result
+        if (result and result != "NOT_FOUND" and
+            len(result) > 0 and len(result) < 50 and
+            len(result.split()) <= 4):  # Max 4 words
+            return result
+
+        return ""
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ URL name guessing failed: {str(e)[:50]}")
+        return ""
+
 def prefill_from_website(website_url: str):
-    """Fetch page → extract doctor name, email, phone, practice name, and address → store in session_state.draft with messaging"""
+    """LLM-only extraction with URL-based practice name guessing"""
     if not website_url:
         return
 
-    # Initialize error messages
-    email_message = ""
-    phone_message = ""
-    name_message = ""
-    address_message = ""
+    # Initialize all fields and messages
+    email_message = phone_message = name_message = address_message = ""
+    practice_name = email = phone = addr = maps_link = ""
 
     # Store the last error for better messaging
     st.session_state.last_fetch_error = None
 
-    # fetch & parse
+    # Check if LLM is available
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        st.session_state.draft.update({
+            "website": website_url,
+            "email": "",
+            "phone": "",
+            "practice_name": "",
+            "address": "",
+            "maps_link": "",
+            "email_message": "LLM unavailable. Please fill email manually.",
+            "phone_message": "LLM unavailable. Please fill phone manually.",
+            "name_message": "LLM unavailable. Please fill practice name manually.",
+            "address_message": "LLM unavailable. Please fill address manually.",
+        })
+        return
+
+    # Fetch webpage
     soup, load_time = fetch_html(website_url)
 
     if not soup:
-        # More specific error messages based on what happened
         error_type = st.session_state.get("last_fetch_error", "unknown")
-
         error_messages = {
             "blocked": "Website blocked automated access",
             "not_found": "Website not found",
@@ -792,7 +793,6 @@ def prefill_from_website(website_url: str):
             "unexpected": "Unexpected error occurred",
             "unknown": "Couldn't load website"
         }
-
         error_msg = error_messages.get(error_type, "Couldn't load website")
 
         st.session_state.draft.update({
@@ -809,49 +809,16 @@ def prefill_from_website(website_url: str):
         })
         return
 
-    # Step 1: Try traditional extraction methods for practice name and address
-    practice_name = extract_practice_name(soup)
-    addr, maps_link = extract_address_and_maplink(soup)
-
-    # Step 2: Use LLM extraction for missing fields
+    # LLM-ONLY extraction approach
     st.sidebar.write("🤖 Using AI to extract contact details...")
 
-    if not practice_name:
-        practice_name = extract_practice_name_with_llm(soup, website_url)
+    # Step 1: Guess practice name from URL and validate with LLM
+    practice_name = guess_practice_name_from_url_with_llm(website_url, soup)
 
-    if not addr:
-        addr = extract_address_with_llm(soup, website_url)
-
-    # Extract email and phone using LLM
+    # Step 2: Extract all other fields using ONLY LLM
+    addr = extract_address_with_llm(soup, website_url)
     email = extract_email_with_llm(soup, website_url)
     phone = extract_phone_with_llm(soup, website_url)
-
-    # Step 3: Places API fallback for practice name and address if still missing
-    if not practice_name or not addr:
-        pid = find_best_place_id(practice_name or "", "", website_url)
-        if pid:
-            det = places_details(pid)
-            if det and det.get("status") == "OK":
-                r = det["result"]
-                if not practice_name:
-                    practice_name = r.get("name") or practice_name
-                if not addr:
-                    places_addr = r.get("formatted_address")
-                    if places_addr:
-                        # Validate Places API address with geocoding
-                        shortened = shorten_address(places_addr)
-                        is_valid, validated_addr = validate_address_with_geocoding(shortened)
-                        if is_valid:
-                            addr = validated_addr
-                            st.sidebar.write(f"✅ Places API address validated: {addr[:50]}...")
-                        else:
-                            # If validation fails, don't use the address
-                            st.sidebar.write(f"❌ Places API address not validated: {shortened[:50]}...")
-                            addr = None
-                if not phone:
-                    phone = r.get("international_phone_number") or phone
-                if pid and not maps_link:
-                    maps_link = f"https://www.google.com/maps/search/?api=1&query=place_id:{pid}"
 
     # Step 4: Set messages for missing information and success indicators
     if not email:
