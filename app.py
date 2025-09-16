@@ -2057,11 +2057,11 @@ def generate_patient_experience_insights(appointment_channels: str, insurance_in
 
 # --- Enhanced LLM-based reputation analysis ---
 def analyze_review_texts(reviews):
-    """Enhanced review analysis using Claude AI with keyword fallback"""
+    """Review analysis using ONLY Claude AI LLM - no fallback methods"""
     if not reviews:
         return "Search limited", "Search limited", "Search limited"
 
-    # Try LLM analysis first
+    # Use ONLY LLM analysis - no fallbacks
     llm_result = analyze_reviews_with_llm(reviews)
     if llm_result:
         sentiment = llm_result.get("sentiment", "Mostly positive feedback")
@@ -2069,8 +2069,78 @@ def analyze_review_texts(reviews):
         negative_themes = llm_result.get("negative_themes", "None detected")
         return sentiment, positive_themes, negative_themes
 
-    # Fallback to keyword-based analysis
-    return analyze_reviews_with_keywords(reviews)
+    # If LLM is not available or fails, return search limited
+    return "Search limited", "Search limited", "Search limited"
+
+def extract_ratings_with_llm(reviews, details):
+    """Extract rating information using ONLY LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and reviews):
+        return {
+            "all_time_avg": "Search limited",
+            "recent_avg": "Search limited",
+            "total_count": "Search limited"
+        }
+
+    try:
+        # Prepare review data for LLM
+        review_data = []
+        for review in reviews[:20]:  # Analyze up to 20 reviews
+            rating = review.get("rating", "")
+            text = review.get("text", "").strip()
+            time_desc = review.get("relative_time_description", "")
+            if rating and text:
+                review_data.append(f"Rating: {rating}★, Posted: {time_desc}, Review: {text[:100]}...")
+
+        if not review_data:
+            return {
+                "all_time_avg": "Search limited",
+                "recent_avg": "Search limited",
+                "total_count": "Search limited"
+            }
+
+        reviews_context = "\n\n".join(review_data)
+
+        prompt = f"""
+        Analyze these Google reviews and extract rating statistics:
+
+        {reviews_context}
+
+        Please return a JSON response with:
+        {{
+            "all_time_avg": "Overall average rating (e.g., '4.2 stars')",
+            "recent_avg": "Recent 10 reviews average (e.g., '4.5 stars')",
+            "total_count": "Total number of reviews analyzed (e.g., '25 reviews')"
+        }}
+
+        Be concise and specific with the numbers.
+        """
+
+        response_text = call_claude_api(prompt)
+        if not response_text:
+            return {
+                "all_time_avg": "Search limited",
+                "recent_avg": "Search limited",
+                "total_count": "Search limited"
+            }
+
+        # Parse LLM response
+        response_text = response_text.strip()
+        if "```json" in response_text:
+            json_text = response_text.split("```json")[1].split("```")[0].strip()
+        else:
+            json_text = response_text
+
+        import json
+        result = json.loads(json_text)
+        return result
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM rating extraction failed: {str(e)[:50]}")
+        return {
+            "all_time_avg": "Search limited",
+            "recent_avg": "Search limited",
+            "total_count": "Search limited"
+        }
 
 def analyze_reviews_with_llm(reviews):
     """Use Claude AI to analyze dental practice reviews"""
@@ -2135,45 +2205,6 @@ def analyze_reviews_with_llm(reviews):
     except Exception as e:
         st.sidebar.write(f"LLM review analysis error: {str(e)[:100]}")
         return None
-
-def analyze_reviews_with_keywords(reviews):
-    """Fallback keyword-based review analysis"""
-    text_blob = " ".join((rv.get("text") or "") for rv in reviews).lower()
-    positive_themes = {
-        "friendly staff": ["friendly","kind","caring","nice","welcoming","courteous"],
-        "cleanliness": ["clean","hygienic","spotless"],
-        "pain-free experience": ["painless","no pain","gentle","pain free","comfortable"],
-        "professionalism": ["professional","expert","knowledgeable"],
-        "communication": ["explained","explain","transparent","informative"]
-    }
-    negative_themes = {
-        "long wait": ["wait","waiting","late","delay","overbooked"],
-        "billing issues": ["billing","charges","overcharged","invoice","insurance problem"],
-        "front desk experience": ["front desk","reception","rude","unhelpful"],
-        "pain/discomfort": ["painful","hurt","rough","uncomfortable"],
-        "upselling": ["upsell","salesy","sold me","pushy"]
-    }
-    def count_hits(theme_dict):
-        scores = {}
-        for theme, kws in theme_dict.items():
-            c = 0
-            for kw in kws:
-                c += text_blob.count(kw)
-            if c > 0: scores[theme] = c
-        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    pos = count_hits(positive_themes)
-    neg = count_hits(negative_themes)
-    pos_total = sum(v for _, v in pos); neg_total = sum(v for _, v in neg)
-    if pos_total == 0 and neg_total == 0:
-        sentiment = "Mixed/neutral (few obvious themes)"
-    elif pos_total >= neg_total:
-        sentiment = f"Mostly positive mentions ({pos_total} vs {neg_total})"
-    else:
-        sentiment = f"Mixed with notable concerns ({neg_total} negatives vs {pos_total} positives)"
-    def top3(items):
-        if not items: return "None detected"
-        return "; ".join([f"{k} ({v})" for k, v in items[:3]])
-    return sentiment, top3(pos), top3(neg)
 
 # --- Scoring ---
 def to_pct_from_score_str(s):
@@ -4052,19 +4083,31 @@ if st.session_state.submitted:
 
         # 3) Reputation
         rating_str, review_count_out, reviews = rating_and_reviews(details)
-        all_time_rating, recent_rating = calculate_separate_ratings(details)
-        sentiment_summary, top_pos_str, top_neg_str = analyze_review_texts(reviews)
+        # Use ONLY LLM for ALL reputation data extraction
+        if HAS_CLAUDE and CLAUDE_API_KEY and reviews:
+            sentiment_summary, top_pos_str, top_neg_str = analyze_review_texts(reviews)
 
-        # Get additional LLM insights from comprehensive analysis
-        key_insights = ""
-        if comprehensive_analysis and comprehensive_analysis.get("reputation"):
-            reputation_data = comprehensive_analysis["reputation"]
-            key_insights = reputation_data.get("advice", "") or reputation_data.get("sentiment", "")
+            # Use LLM to extract rating information
+            llm_ratings = extract_ratings_with_llm(reviews, details)
+            all_time_rating = llm_ratings.get("all_time_avg", "Search limited")
+            recent_rating = llm_ratings.get("recent_avg", "Search limited")
+            review_count_llm = llm_ratings.get("total_count", "Search limited")
+
+            # Get additional LLM insights from comprehensive analysis
+            key_insights = ""
+            if comprehensive_analysis and comprehensive_analysis.get("reputation"):
+                reputation_data = comprehensive_analysis["reputation"]
+                key_insights = reputation_data.get("advice", "") or reputation_data.get("sentiment", "")
+        else:
+            # If LLM not available, all fields show search limited
+            sentiment_summary, top_pos_str, top_neg_str = "Search limited", "Search limited", "Search limited"
+            all_time_rating = recent_rating = review_count_llm = "Search limited"
+            key_insights = "Search limited"
 
         reputation = {
             "Google Reviews (All-time Avg)": all_time_rating,
             "Google Reviews (Recent 10 Avg)": recent_rating,
-            "Total Google Reviews": review_count_out,
+            "Total Google Reviews": review_count_llm,
             "Sentiment Highlights": sentiment_summary,
             "Top Positive Themes": top_pos_str,
             "Top Negative Themes": top_neg_str,
