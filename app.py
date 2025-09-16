@@ -196,6 +196,23 @@ if st.session_state.get('report_ready', False):
                 del st.session_state[key]
         st.rerun()
 
+    # Add footer below the Run Another Audit button
+    st.markdown("---")
+    # Read logo for footer
+    with open("assets/logo-big.png", "rb") as footer_logo_file:
+        footer_logo_base64 = base64.b64encode(footer_logo_file.read()).decode()
+
+    st.markdown(f"""
+    <div style="text-align: center; padding: 2rem 0; background: linear-gradient(90deg, #f8f9fa 0%, #ffffff 50%, #f8f9fa 100%); border-radius: 10px; margin-top: 3rem;">
+        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 1rem;">
+            <img src="data:image/png;base64,{footer_logo_base64}" width="40" style="margin-right: 10px;">
+            <h4 style="margin: 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
+        </div>
+        <p style="color: #666; margin: 0; font-size: 0.9rem;">Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
+        <p style="color: #999; margin: 0.5rem 0 0 0; font-size: 0.8rem;">© 2025 Needle Tail. All rights reserved.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
     # Stop rendering the rest of the page
     st.stop()
 
@@ -276,38 +293,134 @@ def extract_practice_name(soup: BeautifulSoup):
         return og["content"].strip()
     return None
 
+def shorten_address(full_address: str) -> str:
+    """
+    Shorten a full address to be less descriptive while keeping essential info
+    Example: "123 Main Street, Suite 456, Downtown District, Springfield, IL 62701, USA"
+    becomes "123 Main Street, Springfield, IL 62701"
+    """
+    if not full_address or full_address.strip() == "":
+        return full_address
+
+    # Remove common verbose elements
+    address = full_address.strip()
+
+    # Split by commas and process each part
+    parts = [part.strip() for part in address.split(',')]
+    filtered_parts = []
+
+    # Keep essential parts, filter out verbose ones
+    for part in parts:
+        part_lower = part.lower()
+        # Skip overly descriptive parts
+        if any(skip in part_lower for skip in [
+            'suite', 'unit', 'floor', 'building', 'complex', 'plaza', 'center',
+            'district', 'neighborhood', 'area', 'united states', 'usa', 'america'
+        ]):
+            continue
+
+        # Keep street address, city, state/province, postal code
+        if part and len(part) > 1:
+            filtered_parts.append(part)
+
+    # Limit to maximum 4 parts (street, city, state, zip)
+    if len(filtered_parts) > 4:
+        # Keep first part (street) and last 3 parts (city, state, zip)
+        filtered_parts = [filtered_parts[0]] + filtered_parts[-3:]
+
+    return ', '.join(filtered_parts)
+
+def validate_address_with_geocoding(address: str) -> tuple[bool, str]:
+    """
+    Validate an address using Google Geocoding API reverse search
+    Returns (is_valid, validated_address)
+    """
+    if not address or not PLACES_API_KEY:
+        return False, address
+
+    try:
+        # Use Google Geocoding API to validate address
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": address,
+            "key": PLACES_API_KEY
+        }
+
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            return False, address
+
+        data = response.json()
+
+        if data.get("status") == "OK" and data.get("results"):
+            # Get the first result (most accurate)
+            result = data["results"][0]
+            validated_address = result.get("formatted_address", address)
+
+            # Shorten the validated address
+            shortened = shorten_address(validated_address)
+            return True, shortened
+        else:
+            return False, address
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Address validation failed: {str(e)[:50]}")
+        return False, address
+
 def extract_address_and_maplink(soup: BeautifulSoup):
     if not soup:
         return None, None
+
+    extracted_address = None
+    maps_link = None
+
     # 1) direct Google Maps style links
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if any(k in href for k in ["google.com/maps", "goo.gl/maps", "maps.app.goo.gl", "g.page/"]):
             text = a.get_text(" ", strip=True)
             if text and not re.match(r"^https?://", text):
-                return text, href
-            return None, href
+                extracted_address = text
+                maps_link = href
+                break
+            maps_link = href
 
     # 2) schema.org PostalAddress
-    postal = soup.find(attrs={"itemtype": re.compile(r"schema\.org/PostalAddress", re.I)})
-    if postal:
-        parts = []
-        for key in ["streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"]:
-            el = postal.find(attrs={"itemprop": key})
-            if el:
-                parts.append(el.get_text(" ", strip=True))
-        addr = ", ".join([p for p in parts if p])
-        if addr:
-            return addr, None
+    if not extracted_address:
+        postal = soup.find(attrs={"itemtype": re.compile(r"schema\.org/PostalAddress", re.I)})
+        if postal:
+            parts = []
+            for key in ["streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"]:
+                el = postal.find(attrs={"itemprop": key})
+                if el:
+                    parts.append(el.get_text(" ", strip=True))
+            addr = ", ".join([p for p in parts if p])
+            if addr:
+                extracted_address = addr
 
     # 3) Regex fallback (tune for your regions)
-    text = soup.get_text("\n", strip=True)
-    m = re.search(
-        r"\d{1,6}\s+[^\n,]+(?:road|rd\.?|street|st\.?|ave|avenue|blvd|lane|ln|dr|drive|hwy|highway|pkwy|parkway|mall|suite|ste|floor|fl|#)[^\n]*",
-        text, flags=re.I
-    )
-    if m:
-        return m.group(0).strip(), None
+    if not extracted_address:
+        text = soup.get_text("\n", strip=True)
+        m = re.search(
+            r"\d{1,6}\s+[^\n,]+(?:road|rd\.?|street|st\.?|ave|avenue|blvd|lane|ln|dr|drive|hwy|highway|pkwy|parkway|mall|suite|ste|floor|fl|#)[^\n]*",
+            text, flags=re.I
+        )
+        if m:
+            extracted_address = m.group(0).strip()
+
+    # If we found an address, shorten and validate it
+    if extracted_address:
+        # First shorten the address
+        shortened_address = shorten_address(extracted_address)
+
+        # Then validate and potentially get a better version
+        is_valid, validated_address = validate_address_with_geocoding(shortened_address)
+
+        if is_valid:
+            return validated_address, maps_link
+        else:
+            # If validation fails, don't return the address - only return the maps link
+            return None, maps_link
 
     return None, None
 
@@ -394,7 +507,18 @@ def extract_address_with_llm(soup: BeautifulSoup, website_url: str):
             not result.lower().startswith('http') and  # Not a URL
             any(word in result.lower() for word in ['street', 'st', 'avenue', 'ave', 'road', 'rd', 'drive', 'dr', 'lane', 'ln', 'blvd', 'suite', 'ste', 'way', 'place', 'circle', 'court']) and
             any(char.isdigit() for char in result)):  # Should contain at least one number
-            return result.strip()
+
+            # Shorten and validate the LLM-extracted address with Google Maps
+            shortened_address = shorten_address(result.strip())
+            is_valid, validated_address = validate_address_with_geocoding(shortened_address)
+
+            if is_valid:
+                st.sidebar.write(f"✅ Address validated with Google Maps: {validated_address[:50]}...")
+                return validated_address
+            else:
+                # If validation fails, don't return the address - let it be empty
+                st.sidebar.write(f"❌ Address not found in Google Maps: {shortened_address[:50]}...")
+                return None
 
         return None
 
@@ -529,6 +653,113 @@ def extract_phone_with_llm(soup: BeautifulSoup, website_url: str):
         st.sidebar.write(f"⚠️ LLM phone extraction failed: {str(e)[:50]}")
         return None
 
+def extract_appointment_channels_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract appointment booking methods using LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None, None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:2000]
+
+        # Create focused prompt for appointment channels
+        prompt = f"""
+        Analyze this dental practice website to identify appointment booking methods.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Instructions:
+        - Identify how patients can book appointments
+        - Be VERY concise - use minimal words
+        - Look for: online booking, phone numbers, forms, third-party systems
+
+        Return in this exact format:
+        CHANNELS: [concise list, max 5 words]
+        SCORE: [Phone-only/Phone + Online Form/Phone + Advanced System]
+
+        Appointment Analysis:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None, None
+
+        result = result.strip()
+
+        # Parse the result
+        channels = ""
+        score = "Phone-only"
+
+        if "CHANNELS:" in result:
+            channels_line = result.split("CHANNELS:")[1].split("SCORE:")[0].strip()
+            channels = channels_line
+
+        if "SCORE:" in result:
+            score_line = result.split("SCORE:")[1].strip()
+            score = score_line
+
+        return channels, score
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM appointment channels extraction failed: {str(e)[:50]}")
+        return None, None
+
+def extract_insurance_info_with_llm(soup: BeautifulSoup, website_url: str):
+    """Extract insurance information using LLM"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return None
+
+    try:
+        # Get page content
+        page_text = soup.get_text(" ", strip=True)[:2000]
+
+        # Create focused prompt for insurance info
+        prompt = f"""
+        Extract insurance information from this dental practice website.
+
+        Website URL: {website_url}
+        Content: {page_text}
+
+        Requirements:
+        - MAXIMUM 3 lines only
+        - Each line maximum 15 words
+        - Be specific about insurance plans (Delta Dental, Blue Cross, Cigna, etc.)
+        - If no insurance info found, return: "No insurance information found"
+        - If they don't accept insurance, return: "Does not accept insurance"
+        - Format as simple sentences, not bullet points
+
+        Examples:
+        "Accepts most major insurance plans including Delta Dental and Blue Cross"
+        "PPO and HMO plans welcome with payment plans available"
+        "No insurance information found"
+        """
+
+        result = call_claude_api(prompt)
+        if not result:
+            return None
+
+        result = result.strip()
+
+        if result and result != "NOT_FOUND" and len(result) > 5:
+            # Limit to exactly 3 lines maximum
+            lines = [line.strip() for line in result.split('\n') if line.strip()]
+
+            # Take only first 3 lines
+            if len(lines) > 3:
+                lines = lines[:3]
+
+            # Join lines with newline for multi-line display, or space for single line
+            if len(lines) > 1:
+                return '\n'.join(lines)
+            else:
+                return lines[0] if lines else result
+
+        return None
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ LLM insurance extraction failed: {str(e)[:50]}")
+        return None
+
 def prefill_from_website(website_url: str):
     """Fetch page → extract doctor name, email, phone, practice name, and address → store in session_state.draft with messaging"""
     if not website_url:
@@ -605,7 +836,18 @@ def prefill_from_website(website_url: str):
                 if not practice_name:
                     practice_name = r.get("name") or practice_name
                 if not addr:
-                    addr = r.get("formatted_address") or addr
+                    places_addr = r.get("formatted_address")
+                    if places_addr:
+                        # Validate Places API address with geocoding
+                        shortened = shorten_address(places_addr)
+                        is_valid, validated_addr = validate_address_with_geocoding(shortened)
+                        if is_valid:
+                            addr = validated_addr
+                            st.sidebar.write(f"✅ Places API address validated: {addr[:50]}...")
+                        else:
+                            # If validation fails, don't use the address
+                            st.sidebar.write(f"❌ Places API address not validated: {shortened[:50]}...")
+                            addr = None
                 if not phone:
                     phone = r.get("international_phone_number") or phone
                 if pid and not maps_link:
@@ -801,6 +1043,32 @@ def rating_and_reviews(details: dict):
     rating_str = f"{rating}/5" if rating is not None else "Search limited"
     total_reviews = count if count is not None else "Search limited"
     return rating_str, total_reviews, simplified
+
+def calculate_separate_ratings(details: dict):
+    """Calculate all-time average and recent 10 ratings separately"""
+    if not details or details.get("status") != "OK":
+        return "Search limited", "Search limited"
+
+    res = details.get("result", {})
+    all_time_rating = res.get("rating")
+    reviews = res.get("reviews", []) or []
+
+    # Calculate average of recent 10 ratings
+    recent_ratings = []
+    for rv in reviews[:10]:  # Google typically returns up to 5 recent reviews
+        rating = rv.get("rating")
+        if rating is not None:
+            recent_ratings.append(rating)
+
+    all_time_str = f"{all_time_rating}/5" if all_time_rating is not None else "Search limited"
+
+    if recent_ratings:
+        recent_avg = sum(recent_ratings) / len(recent_ratings)
+        recent_str = f"{recent_avg:.1f}/5 (from {len(recent_ratings)} recent reviews)"
+    else:
+        recent_str = "No recent reviews available"
+
+    return all_time_str, recent_str
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def office_hours_from_places(details: dict):
@@ -1421,7 +1689,7 @@ def analyze_marketing_signals_with_llm(_soup: BeautifulSoup, website_url: str, p
             "content_quality": "Assessment of website content effectiveness",
             "visual_appeal": "Analysis of photos/videos and visual elements",
             "seo_signals": "SEO optimization status and recommendations",
-            "conversion_optimization": "Assessment of call-to-actions and conversion elements",
+            "conversion_optimization": "How easy it is for patients to book appointments from the website",
             "patient_engagement": "How well the site engages potential patients",
             "marketing_tools": "Detected marketing/tracking tools analysis",
             "key_recommendations": "Top 3 actionable marketing improvements"
@@ -1501,6 +1769,171 @@ def advertising_signals(_soup: BeautifulSoup):
 
     return detected_tools
 
+def analyze_website_conversion_elements(soup: BeautifulSoup):
+    """Analyze how well the website encourages visitors to become patients"""
+    if not soup:
+        return "Could not analyze website"
+
+    html = str(soup).lower()
+    text = soup.get_text(" ", strip=True).lower()
+
+    user_friendly_features = []
+
+    # Call-to-action buttons (action prompts)
+    action_keywords = ['book', 'appointment', 'call now', 'schedule', 'contact', 'get started', 'free consultation']
+    action_count = sum(1 for keyword in action_keywords if keyword in text)
+    if action_count >= 3:
+        user_friendly_features.append("Easy to find appointment buttons")
+    elif action_count > 0:
+        user_friendly_features.append("Some appointment options available")
+
+    # Contact information visibility
+    if 'phone' in text and ('call' in text or 'tel:' in html):
+        user_friendly_features.append("Phone number clearly displayed")
+
+    # Contact forms
+    forms = soup.find_all('form')
+    if len(forms) > 1:
+        user_friendly_features.append("Multiple ways to contact practice")
+    elif forms:
+        user_friendly_features.append("Contact form available")
+
+    # Credibility indicators
+    trust_keywords = ['certified', 'award', 'years experience', 'licensed', 'dds', 'dmd', 'insurance accepted']
+    trust_count = sum(1 for keyword in trust_keywords if keyword in text)
+    if trust_count >= 2:
+        user_friendly_features.append("Shows doctor credentials and experience")
+
+    return '; '.join(user_friendly_features) if user_friendly_features else "Website could be more patient-friendly"
+
+def analyze_content_marketing(soup: BeautifulSoup, website_url: str = ""):
+    """Analyze content marketing strategy and quality"""
+    if not soup:
+        return "Search limited"
+
+    content_signals = []
+    text = soup.get_text(" ", strip=True).lower()
+
+    # Blog/content sections
+    blog_indicators = ['blog', 'articles', 'news', 'tips', 'education', 'learn more']
+    if any(indicator in text for indicator in blog_indicators):
+        content_signals.append("Educational content")
+
+    # Service descriptions
+    service_keywords = ['services', 'treatment', 'procedure', 'cleaning', 'whitening', 'implant', 'orthodontic']
+    service_count = sum(1 for keyword in service_keywords if keyword in text)
+    if service_count >= 4:
+        content_signals.append("Comprehensive service descriptions")
+    elif service_count > 0:
+        content_signals.append("Basic service information")
+
+    # Patient testimonials/reviews
+    testimonial_keywords = ['testimonial', 'review', 'patient says', 'happy patient', 'success story']
+    if any(keyword in text for keyword in testimonial_keywords):
+        content_signals.append("Patient testimonials")
+
+    # Before/after content
+    if 'before' in text and 'after' in text:
+        content_signals.append("Before/after showcases")
+
+    return '; '.join(content_signals) if content_signals else "Basic content strategy"
+
+def analyze_local_seo_signals(soup: BeautifulSoup, address: str = ""):
+    """Analyze local SEO optimization"""
+    if not soup:
+        return "Search limited"
+
+    html = str(soup).lower()
+    text = soup.get_text(" ", strip=True).lower()
+
+    local_signals = []
+
+    # Schema markup
+    if 'schema.org' in html and ('localbusiness' in html or 'dentist' in html):
+        local_signals.append("Schema markup")
+
+    # NAP consistency (Name, Address, Phone)
+    if address:
+        address_parts = address.lower().split(',')
+        if len(address_parts) > 0 and address_parts[0].strip() in text:
+            local_signals.append("Address consistency")
+
+    # Local keywords
+    local_keywords = ['dentist near', 'dental practice', 'local dentist', 'area dentist', 'neighborhood']
+    local_count = sum(1 for keyword in local_keywords if keyword in text)
+    if local_count >= 2:
+        local_signals.append("Local keyword optimization")
+
+    # Google My Business integration
+    if 'google.com/maps' in html or 'google my business' in text:
+        local_signals.append("GMB integration")
+
+    # Location pages
+    location_keywords = ['location', 'directions', 'hours', 'address', 'visit us']
+    if sum(1 for keyword in location_keywords if keyword in text) >= 3:
+        local_signals.append("Location information complete")
+
+    return '; '.join(local_signals) if local_signals else "Limited local SEO"
+
+def generate_marketing_insights(soup: BeautifulSoup, website_url: str, practice_name: str, social_data: dict, photos_count: int, advertising_tools: str):
+    """Generate AI-powered marketing insights and recommendations"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        return "Enable Claude AI for detailed insights"
+
+    try:
+        # Gather marketing data
+        text_content = soup.get_text(" ", strip=True)[:2000]
+        conversion_elements = analyze_website_conversion_elements(soup)
+        content_strategy = analyze_content_marketing(soup, website_url)
+        local_seo = analyze_local_seo_signals(soup)
+
+        # Social media status
+        social_platforms = []
+        if social_data:
+            for platform, status in social_data.items():
+                if status and status != "❌":
+                    social_platforms.append(platform)
+
+        prompt = f"""
+        Analyze this dental practice's marketing and provide EXACTLY 3 short, actionable recommendations:
+
+        Practice: {practice_name}
+        Current Status:
+        - Social Media: {', '.join(social_platforms) if social_platforms else 'Limited presence'}
+        - Photos: {photos_count} on Google
+        - Tools: {advertising_tools}
+        - Website Features: {conversion_elements}
+
+        Requirements:
+        - EXACTLY 3 bullet points only
+        - Maximum 15 words per point
+        - Straight to the point, no fluff
+        - Focus on biggest impact improvements
+        - Format: • [action]
+
+        Example:
+        • Add before/after photos to showcase results
+        • Set up online appointment booking system
+        • Create Google My Business posts weekly
+        """
+
+        result = call_claude_api(prompt)
+        if result and result.strip():
+            # Ensure exactly 3 lines
+            lines = [line.strip() for line in result.strip().split('\n') if line.strip()]
+            # Take first 3 lines that start with bullet points
+            bullet_lines = [line for line in lines if line.startswith('•')]
+            if len(bullet_lines) >= 3:
+                return '\n'.join(bullet_lines[:3])
+            else:
+                return result.strip()
+        else:
+            return "• Optimize Google My Business with more photos\n• Add patient testimonials to build trust\n• Implement clear call-to-action buttons"
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Marketing insights error: {str(e)[:50]}")
+        return "• Optimize Google My Business profile\n• Add more professional photos\n• Implement online booking system"
+
 def appointment_booking_from_site(soup: BeautifulSoup):
     if not soup: return "Search limited"
     t = soup.get_text(" ", strip=True).lower()
@@ -1518,13 +1951,123 @@ def insurance_from_site(soup: BeautifulSoup):
         return m.group(0) if m else "Mentioned on site"
     return "Unclear"
 
+def appointment_channels_from_site(soup: BeautifulSoup, website_url: str = ""):
+    """Enhanced appointment booking analysis with LLM support (max 10 words)"""
+    if not soup:
+        return "Search limited"
+
+    def limit_to_10_words(text: str) -> str:
+        """Limit text to maximum 10 words"""
+        words = text.split()
+        return ' '.join(words[:10])
+
+    # Try LLM analysis first
+    if HAS_CLAUDE and CLAUDE_API_KEY and website_url:
+        channels, score = extract_appointment_channels_with_llm(soup, website_url)
+        if channels and score:
+            # Format the response and limit to 10 words
+            full_response = f"{score} - {channels}"
+            return limit_to_10_words(full_response)
+
+    # Fallback to traditional analysis (already under 10 words)
+    t = soup.get_text(" ", strip=True).lower()
+    if any(p in t for p in ["book", "appointment", "schedule", "reserve"]):
+        if "calendly" in t or "zocdoc" in t or "square appointments" in t:
+            return "Phone + Advanced System"
+        return "Phone + Online Form"
+    return "Phone-only"
+
+def enhanced_insurance_from_site(soup: BeautifulSoup, website_url: str = ""):
+    """Enhanced insurance analysis with LLM support"""
+    if not soup:
+        return "Search limited"
+
+    # Try LLM analysis first
+    if HAS_CLAUDE and CLAUDE_API_KEY and website_url:
+        insurance_info = extract_insurance_info_with_llm(soup, website_url)
+        if insurance_info:
+            return insurance_info
+
+    # Fallback to traditional analysis
+    t = soup.get_text(" ", strip=True).lower()
+    if "insurance" in t or "we accept" in t or "ppo" in t or "delta dental" in t:
+        m = re.search(r"([^.]*insurance[^.]*\.)", t)
+        if m:
+            # Limit fallback to 3 lines max
+            fallback_text = m.group(0)
+            if len(fallback_text) > 100:  # If too long, shorten it
+                return "Insurance accepted - Check website for details"
+            return fallback_text
+        return "Insurance accepted - Details on website"
+    return "No insurance information found"
+
+def generate_patient_experience_insights(appointment_channels: str, insurance_info: str, office_hours: str):
+    """Generate AI insights for patient experience improvements"""
+    if not (HAS_CLAUDE and CLAUDE_API_KEY):
+        return "• Improve online booking convenience\n• Clarify insurance acceptance\n• Optimize office hours for patients"
+
+    try:
+        prompt = f"""
+        You are an expert patient experience consultant for dental practices. Analyze this practice's patient convenience data and provide actionable improvement insights.
+
+        Patient Experience Data:
+        - Appointment Options Available: {appointment_channels}
+        - Insurance Information: {insurance_info}
+        - Office Hours (as mentioned in Website): {office_hours}
+
+        Provide exactly 3 actionable bullet points to improve patient experience. Focus on:
+        - Appointment booking convenience
+        - Insurance clarity and payment options
+        - Accessibility and communication improvements
+
+        Format as: • Point 1\n• Point 2\n• Point 3
+
+        Keep each point under 60 characters and immediately actionable.
+
+        Patient Experience Insights:"""
+
+        result = call_claude_api(prompt)
+        if not result:
+            return "• Improve online booking convenience\n• Clarify insurance acceptance\n• Optimize office hours for patients"
+
+        result = result.strip()
+
+        # Ensure proper bullet point formatting
+        if "•" in result:
+            return result
+        else:
+            # Convert to bullet points if not formatted properly
+            lines = result.split('\n')[:3]
+            bullet_points = []
+            for line in lines:
+                line = line.strip()
+                if line and len(line) > 5:
+                    if not line.startswith('•'):
+                        line = f"• {line}"
+                    bullet_points.append(line)
+
+            if bullet_points:
+                return '\n'.join(bullet_points)
+
+        return "• Improve online booking convenience\n• Clarify insurance acceptance\n• Optimize office hours for patients"
+
+    except Exception as e:
+        st.sidebar.write(f"⚠️ Patient experience insights failed: {str(e)[:50]}")
+        return "• Improve online booking convenience\n• Clarify insurance acceptance\n• Optimize office hours for patients"
+
 # --- Enhanced LLM-based reputation analysis ---
 def analyze_review_texts(reviews):
     """Enhanced review analysis using Claude AI with keyword fallback"""
     if not reviews:
         return "Search limited", "Search limited", "Search limited"
 
-    # Note: LLM analysis handled by comprehensive_llm_analysis for performance
+    # Try LLM analysis first
+    llm_result = analyze_reviews_with_llm(reviews)
+    if llm_result:
+        sentiment = llm_result.get("sentiment", "Mostly positive feedback")
+        positive_themes = llm_result.get("positive_themes", "Professional staff, clean environment")
+        negative_themes = llm_result.get("negative_themes", "None detected")
+        return sentiment, positive_themes, negative_themes
 
     # Fallback to keyword-based analysis
     return analyze_reviews_with_keywords(reviews)
@@ -2065,21 +2608,294 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
 
     style = """
     <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;padding:24px;line-height:1.55;background:#fff}
-      h1{margin:0 0 8px; color:#6D28D9; font-size:32px} h2{margin:24px 0 12px; color:#4F46E5}
-      table{border-collapse:collapse;width:100%; margin-bottom:20px}
-      th,td{border:1px solid #e5e7eb;padding:12px;text-align:left}
-      th{background:#f8fafc;width:35%;font-weight:600;color:#374151}
-      .scores{margin:16px 0 24px; text-align:center}
-      .chip{display:inline-block;margin:0 8px 8px 0;padding:8px 16px;background:linear-gradient(90deg,#6D28D9,#4F46E5);color:white;border-radius:12px;font-weight:600;box-shadow:0 2px 4px rgba(109,40,217,0.2)}
-      a{color:#0b57d0;text-decoration:none} a:hover{text-decoration:underline}
-      section{margin-bottom:24px; background:#fafafa; padding:16px; border-radius:8px; border-left:4px solid #6D28D9}
-      .email-button{background:linear-gradient(90deg,#6D28D9,#4F46E5);color:white;border:none;padding:14px 28px;border-radius:8px;font-size:16px;cursor:pointer;margin:20px auto;display:block;font-weight:600;transition:all 0.3s ease}
-      .email-button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(109,40,217,0.3)}
-      .footer{text-align:center;margin-top:32px;padding:20px;background:#f1f5f9;border-radius:8px;color:#64748b}
-      .header-info{background:#f8fafc;padding:16px;border-radius:8px;margin-bottom:20px;border:1px solid #e5e7eb}
-      .reviews-list{background:#fff;padding:16px;border-radius:8px}
-      .reviews-list li{margin-bottom:12px;padding:10px;border-left:3px solid #22D3EE;background:#f0f9ff}
+      * { box-sizing: border-box; }
+      body {
+        font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        line-height: 1.6;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+        color: #333;
+      }
+      .container {
+        max-width: 1000px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .report-card {
+        background: #ffffff;
+        border-radius: 16px;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        overflow: hidden;
+        margin-bottom: 20px;
+      }
+      .report-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 40px;
+        text-align: center;
+        position: relative;
+      }
+      .report-header::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><pattern id="grain" width="100" height="100" patternUnits="userSpaceOnUse"><circle cx="25" cy="25" r="1" fill="%23ffffff" opacity="0.1"/><circle cx="75" cy="75" r="1" fill="%23ffffff" opacity="0.1"/></pattern></defs><rect width="100" height="100" fill="url(%23grain)"/></svg>');
+        opacity: 0.3;
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 2.5rem;
+        font-weight: 700;
+        position: relative;
+        z-index: 1;
+      }
+      .practice-name {
+        font-size: 1.8rem;
+        margin: 0 0 20px;
+        opacity: 0.95;
+        position: relative;
+        z-index: 1;
+      }
+      .header-info {
+        background: rgba(255,255,255,0.15);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255,255,255,0.2);
+        padding: 20px;
+        border-radius: 12px;
+        margin: 20px auto 0;
+        max-width: 600px;
+        position: relative;
+        z-index: 1;
+      }
+      .header-info-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-bottom: 15px;
+      }
+      .header-info-row:last-child {
+        margin-bottom: 0;
+      }
+      .info-item {
+        display: flex;
+        flex-direction: column;
+      }
+      .info-label {
+        font-size: 0.85rem;
+        opacity: 0.8;
+        margin-bottom: 5px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .info-value {
+        font-weight: 600;
+        font-size: 0.95rem;
+      }
+      .scores-container {
+        margin: 30px 0;
+        text-align: center;
+        position: relative;
+        z-index: 1;
+      }
+      .scores-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-top: 20px;
+      }
+      .score-card {
+        background: rgba(255,255,255,0.2);
+        backdrop-filter: blur(10px);
+        padding: 20px;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.3);
+        text-align: center;
+      }
+      .score-value {
+        font-size: 2rem;
+        font-weight: 700;
+        margin-bottom: 5px;
+      }
+      .score-label {
+        font-size: 0.9rem;
+        opacity: 0.9;
+      }
+      .content {
+        padding: 40px;
+      }
+      h2 {
+        color: #4c1d95;
+        font-size: 1.5rem;
+        margin: 0 0 20px;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      h2::before {
+        content: '';
+        width: 4px;
+        height: 24px;
+        background: linear-gradient(135deg, #667eea, #764ba2);
+        border-radius: 2px;
+      }
+      section {
+        margin-bottom: 35px;
+        background: #f8fafc;
+        padding: 25px;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        position: relative;
+        overflow: hidden;
+      }
+      section::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 4px;
+        background: linear-gradient(90deg, #667eea, #764ba2);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 0;
+        background: white;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      }
+      th, td {
+        padding: 16px 20px;
+        text-align: left;
+        border-bottom: 1px solid #e2e8f0;
+      }
+      th {
+        background: linear-gradient(135deg, #f1f5f9, #e2e8f0);
+        font-weight: 600;
+        color: #475569;
+        width: 35%;
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      td {
+        color: #334155;
+        font-weight: 500;
+      }
+      tr:last-child th,
+      tr:last-child td {
+        border-bottom: none;
+      }
+      tr:hover {
+        background: #f8fafc;
+      }
+      a {
+        color: #3b82f6;
+        text-decoration: none;
+        font-weight: 600;
+        transition: all 0.2s ease;
+      }
+      a:hover {
+        color: #1d4ed8;
+        text-decoration: underline;
+      }
+      .reviews-list {
+        background: white;
+        padding: 0;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      }
+      .reviews-list ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+      .reviews-list li {
+        padding: 20px;
+        border-bottom: 1px solid #e2e8f0;
+        position: relative;
+        background: white;
+        transition: all 0.2s ease;
+      }
+      .reviews-list li:last-child {
+        border-bottom: none;
+      }
+      .reviews-list li:hover {
+        background: #f8fafc;
+        transform: translateX(5px);
+      }
+      .reviews-list li::before {
+        content: '★';
+        position: absolute;
+        left: 20px;
+        top: 20px;
+        color: #fbbf24;
+        font-size: 1.2rem;
+      }
+      .reviews-list li {
+        padding-left: 50px;
+      }
+      .review-author {
+        font-weight: 600;
+        color: #4c1d95;
+        margin-bottom: 8px;
+      }
+      .review-text {
+        color: #64748b;
+        line-height: 1.6;
+      }
+      .footer {
+        background: #1e293b;
+        color: #e2e8f0;
+        text-align: center;
+        padding: 40px;
+        margin-top: 40px;
+      }
+      .footer-content {
+        max-width: 600px;
+        margin: 0 auto;
+      }
+      .footer-logo {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 20px;
+        gap: 12px;
+      }
+      .footer h3 {
+        margin: 0;
+        font-size: 1.2rem;
+        color: white;
+      }
+      .footer p {
+        margin: 10px 0;
+        opacity: 0.8;
+        line-height: 1.6;
+      }
+      .footer-copyright {
+        margin-top: 30px;
+        padding-top: 20px;
+        border-top: 1px solid #334155;
+        font-size: 0.9rem;
+        opacity: 0.7;
+      }
+      @media (max-width: 768px) {
+        .container { padding: 10px; }
+        .report-header { padding: 30px 20px; }
+        .content { padding: 25px 20px; }
+        h1 { font-size: 2rem; }
+        .practice-name { font-size: 1.4rem; }
+        .header-info-row { grid-template-columns: 1fr; }
+        .scores-grid { grid-template-columns: repeat(2, 1fr); }
+      }
     </style>
     """
 
@@ -2089,35 +2905,58 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
     addr_html = f'<a href="{escape(maps)}" target="_blank" rel="noopener">{escape(addr)}</a>' if (maps and final.get("address")) else escape(addr)
 
     header = f"""
-      <h1>Face Value Audit Report</h1>
-      <h2>{escape(title)}</h2>
-      <div class="header-info">
-        <strong>Doctor:</strong> {escape(final.get('doctor_name','—'))} &nbsp;|&nbsp;
-        <strong>Website:</strong> {escape(final.get('website','—'))} &nbsp;|&nbsp;
-        <strong>Email:</strong> {escape(final.get('email','—'))} &nbsp;|&nbsp;
-        <strong>Phone:</strong> {escape(final.get('phone','—'))}<br>
-        <strong>Address:</strong> {addr_html}
-      </div>
-      <div class="scores">
-        <div class="chip">Overall Score: {scores['overall']}/100</div>
-        <div class="chip">Visibility: {scores['visibility']}/30</div>
-        <div class="chip">Reputation: {scores['reputation']}/40</div>
-        <div class="chip">Experience: {scores['experience']}/30</div>
+      <div class="report-header">
+        <h1>Face Value Audit Report</h1>
+        <div class="practice-name">{escape(title)}</div>
+        <div class="header-info">
+          <div class="header-info-row">
+            <div class="info-item">
+              <div class="info-label">Doctor</div>
+              <div class="info-value">{escape(final.get('doctor_name','—'))}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Website</div>
+              <div class="info-value">{escape(final.get('website','—'))}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Email</div>
+              <div class="info-value">{escape(final.get('email','—'))}</div>
+            </div>
+          </div>
+          <div class="header-info-row">
+            <div class="info-item">
+              <div class="info-label">Phone</div>
+              <div class="info-value">{escape(final.get('phone','—'))}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Address</div>
+              <div class="info-value">{addr_html}</div>
+            </div>
+          </div>
+        </div>
+        <div class="scores-container">
+          <div class="scores-grid">
+            <div class="score-card">
+              <div class="score-value">{scores['overall']}/100</div>
+              <div class="score-label">Overall Score</div>
+            </div>
+            <div class="score-card">
+              <div class="score-value">{scores['visibility']}/30</div>
+              <div class="score-label">Visibility</div>
+            </div>
+            <div class="score-card">
+              <div class="score-value">{scores['reputation']}/40</div>
+              <div class="score-label">Reputation</div>
+            </div>
+            <div class="score-card">
+              <div class="score-value">{scores['experience']}/30</div>
+              <div class="score-label">Experience</div>
+            </div>
+          </div>
+        </div>
       </div>
     """
 
-    email_button = f"""
-    <button class="email-button" onclick="emailReport()">📧 Email Me This Report</button>
-    <script>
-    function emailReport() {{
-        const subject = encodeURIComponent('Face Value Audit Report - {escape(title)}');
-        const body = encodeURIComponent('Please find my Face Value Audit Report in the link above. Thank you for the comprehensive analysis!');
-        const mailtoLink = `mailto:{escape(email)}?subject=${{subject}}&body=${{body}}`;
-        window.open(mailtoLink, '_blank');
-        alert('✅ Email client opened! Please send the email from your email application.');
-    }}
-    </script>
-    """ if email else ""
 
     # Encode logo for use in report footer
     with open("assets/logo-big.png", "rb") as report_logo_file:
@@ -2125,19 +2964,24 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
 
     footer = f"""
     <div class="footer">
-        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 1rem;">
-            <img src="data:image/png;base64,{report_logo_base64}" width="30" style="margin-right: 8px;">
-            <p style="margin: 0;"><strong>Powered by NeedleTail AI</strong></p>
+        <div class="footer-content">
+            <div class="footer-logo">
+                <img src="data:image/png;base64,{report_logo_base64}" width="40">
+                <h3>Powered by NeedleTail AI</h3>
+            </div>
+            <p>Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
+            <div class="footer-copyright">© 2025 Needle Tail. All rights reserved.</div>
         </div>
-        <p>Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
-        <p style="font-size: 0.9rem; color: #999;">© 2025 Needle Tail. All rights reserved.</p>
     </div>
     """
 
     reviews_section = ""
     if reviews:
         reviews_html = "".join(
-            f"<li><strong>{escape(r.get('author_name', 'Anonymous'))}</strong>: {escape((r.get('text') or '')[:400])}</li>"
+            f"""<li>
+                <div class="review-author">{escape(r.get('author_name', 'Anonymous'))}</div>
+                <div class="review-text">{escape((r.get('text') or '')[:400])}</div>
+            </li>"""
             for r in reviews[:10]
         )
         reviews_section = f"""
@@ -2151,14 +2995,19 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
 
     html = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Face Value Audit Report – {escape(title)}</title>{style}</head><body>
-    {header}
-    {_kv_table("Practice Overview", overview)}
-    {_kv_table("Online Visibility", visibility)}
-    {_kv_table("Reputation & Feedback", reputation)}
-    {_kv_table("Marketing Signals", marketing)}
-    {_kv_table("Patient Experience", experience)}
-    {reviews_section}
-    {email_button}
+    <div class="container">
+        <div class="report-card">
+            {header}
+            <div class="content">
+                {_kv_table("Practice Overview", overview)}
+                {_kv_table("Online Visibility", visibility)}
+                {_kv_table("Reputation & Feedback", reputation)}
+                {reviews_section}
+                {_kv_table("Marketing Signals", marketing)}
+                {_kv_table("Patient Experience", experience)}
+            </div>
+        </div>
+    </div>
     {footer}
     </body></html>"""
     return html
@@ -2921,7 +3770,7 @@ def show_experience_cards(experience: dict):
     # Choose up to 6 metrics -> fixed 3x2
     order = [
         "Appointment Booking",
-        "Office Hours",
+        "Office Hours (as mentioned in Website)",
         "Insurance Acceptance",
         "Accessibility Signals",   # exists in some runs; safely ignored if missing
     ]
@@ -2940,14 +3789,16 @@ def show_experience_cards(experience: dict):
         if not label or s in ("", "—") or "search limited" in sl:
             return ("Unknown", "badge-muted")
 
-        if label == "Appointment Booking":
-            if any(w in sl for w in ["online", "book", "booking", "zocdoc", "practo", "calendly"]):
+        if label == "Appointment Booking" or label == "Appointment Channels" or label == "Appointment Options Available":
+            if any(w in sl for w in ["phone + advanced", "excellent", "online", "book", "booking", "zocdoc", "practo", "calendly"]):
                 return ("Available", "badge-ok")
+            if any(w in sl for w in ["phone-only", "phone + online form"]):
+                return ("Basic", "badge-warn")
             if any(w in sl for w in ["no", "none", "unavailable"]):
                 return ("Missing", "badge-bad")
             return ("Check", "badge-warn")
 
-        if label == "Office Hours":
+        if label == "Office Hours" or label == "Office Hours (as mentioned in Website)":
             if any(ch.isdigit() for ch in s):
                 return ("Published", "badge-ok")
             return ("Missing", "badge-muted")
@@ -2963,6 +3814,11 @@ def show_experience_cards(experience: dict):
             if any(w in sl for w in ["wheelchair", "accessible", "ramp", "lift"]):
                 return ("Accessible", "badge-ok")
             return ("Unknown", "badge-muted")
+
+        if label == "AI Insights":
+            if s and s not in ("", "—") and "no insights" not in sl:
+                return ("Available", "badge-ok")
+            return ("Unavailable", "badge-muted")
 
         return ("", "badge-muted")
 
@@ -3196,6 +4052,7 @@ if st.session_state.submitted:
 
         # 3) Reputation
         rating_str, review_count_out, reviews = rating_and_reviews(details)
+        all_time_rating, recent_rating = calculate_separate_ratings(details)
         sentiment_summary, top_pos_str, top_neg_str = analyze_review_texts(reviews)
 
         # Get additional LLM insights from comprehensive analysis
@@ -3205,7 +4062,8 @@ if st.session_state.submitted:
             key_insights = reputation_data.get("advice", "") or reputation_data.get("sentiment", "")
 
         reputation = {
-            "Google Reviews (Avg)": rating_str,
+            "Google Reviews (All-time Avg)": all_time_rating,
+            "Google Reviews (Recent 10 Avg)": recent_rating,
             "Total Google Reviews": review_count_out,
             "Sentiment Highlights": sentiment_summary,
             "Top Positive Themes": top_pos_str,
@@ -3216,31 +4074,60 @@ if st.session_state.submitted:
         if key_insights:
             reputation["AI Insights"] = key_insights
 
-        # 4) Marketing
+        # 4) Marketing - Enhanced comprehensive analysis
         # Get comprehensive LLM marketing analysis from cached result
         marketing_insights = ""
         if comprehensive_analysis and comprehensive_analysis.get("marketing"):
             marketing_data = comprehensive_analysis["marketing"]
             marketing_insights = marketing_data.get("key_recommendations", "") or marketing_data.get("advertising_advice", "")
 
+        # Enhanced marketing analysis
+        photos_on_website = media_count_from_site(soup) if soup else "Search limited"
+        photos_in_google = photos_count_from_places(details) if details else "Search limited"
+        advertising_tools = advertising_signals(soup) if soup else "Search limited"
+
+        # New comprehensive marketing metrics
+        conversion_analysis = analyze_website_conversion_elements(soup) if soup else "Search limited"
+        content_strategy = analyze_content_marketing(soup, website) if soup else "Search limited"
+        local_seo_status = analyze_local_seo_signals(soup, final.get('address', '')) if soup else "Search limited"
+
+        # Generate AI-powered marketing insights
+        ai_insights = generate_marketing_insights(
+            soup,
+            website,
+            final.get('practice_name', ''),
+            social_data,
+            photos_in_google if isinstance(photos_in_google, int) else 0,
+            advertising_tools
+        ) if soup else "Enable Claude AI for detailed marketing insights"
+
         marketing = {
-            "Photos/Videos on Website": media_count_from_site(soup) if soup else "Search limited",
-            "Photos count in Google": photos_count_from_places(details) if details else "Search limited",
-            "Advertising Scripts Detected": advertising_signals(soup) if soup else "Search limited",
+            "Website Content Strategy": content_strategy,
+            "Conversion Optimization": conversion_analysis,
+            "Local SEO Signals": local_seo_status,
+            "Photos/Videos on Website": photos_on_website,
+            "Google My Business Photos": photos_in_google,
+            "Marketing & Analytics Tools": advertising_tools,
+            "AI Marketing Strategy Insights": ai_insights
         }
 
-        # Add LLM insights if available
-        if marketing_insights:
-            marketing["AI Marketing Insights"] = marketing_insights
+        # Add legacy LLM insights if available (fallback)
+        if marketing_insights and not ai_insights.startswith("Enable Claude"):
+            marketing["Additional Insights"] = marketing_insights
 
-        # 5) Experience
-        booking = appointment_booking_from_site(soup)
+        # 5) Experience - Enhanced with LLM analysis
+        appointment_channels = appointment_channels_from_site(soup, website)
         hours = office_hours_from_places(details)
-        insurance = insurance_from_site(soup)
+        insurance_info = enhanced_insurance_from_site(soup, website)
+
+        # Generate AI insights for patient experience
+        patient_insights = generate_patient_experience_insights(appointment_channels, insurance_info, hours)
+
         experience = {
-            "Appointment Booking": booking,
-            "Office Hours": hours,
-            "Insurance Acceptance": insurance,
+            "Appointment Options Available": appointment_channels,
+            "Office Hours (as mentioned in Website)": hours,
+            "Insurance Acceptance": insurance_info,
+            "AI Insights": patient_insights,
         }
 
         # ------------------------ Scoring ------------------------
@@ -3254,10 +4141,10 @@ if st.session_state.submitted:
 
         reviews_total = review_count_out if isinstance(review_count_out, (int, float)) else None
         hours_present = isinstance(hours, str) and hours != "Search limited"
-        insurance_clear = isinstance(insurance, str) and insurance not in ["Search limited", "Unclear"]
+        insurance_clear = isinstance(insurance_info, str) and insurance_info not in ["Search limited", "Unclear"]
 
         smile, vis_score, rep_score, exp_score = compute_smile_score(
-            wh_pct, social_data, rating_val, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False
+            wh_pct, social_data, rating_val, reviews_total, appointment_channels, hours_present, insurance_clear, accessibility_present=False
         )
 
         # Build scores dictionary for report
