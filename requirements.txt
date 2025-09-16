@@ -42,5 +42,3 @@ watchdog==6.0.0
 gspread==6.0.0
 google-auth==2.35.0
 anthropic
-asyncio
-concurrent.futures
