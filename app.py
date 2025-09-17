@@ -62,12 +62,23 @@ class AdvancedLLMCache:
 _advanced_cache = AdvancedLLMCache(max_size=_cache_max_size)
 
 # Claude API helper function
-def call_claude_api(prompt: str, model: str = "claude-3-haiku-20240307") -> str:
-    """Helper function to call Claude API"""
+def call_claude_api(prompt: str, model: str = "claude-3-haiku-20240307", timeout: int = 30) -> str:
+    """Helper function to call Claude API with timeout"""
     if not (HAS_CLAUDE and CLAUDE_API_KEY and claude_client):
         return None
 
+    import signal
+    import functools
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError("Claude API call timed out")
+
     try:
+        # Set timeout signal (only on Unix systems)
+        if hasattr(signal, 'SIGALRM'):
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout)
+
         response = claude_client.messages.create(
             model=model,
             max_tokens=1024,
@@ -79,10 +90,22 @@ def call_claude_api(prompt: str, model: str = "claude-3-haiku-20240307") -> str:
                 }
             ]
         )
+
+        # Cancel the alarm
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
+
         return response.content[0].text
+    except TimeoutError:
+        st.warning("⚠️ Claude API took too long. Skipping AI analysis...")
+        return None
     except Exception as e:
         st.sidebar.write(f"⚠️ Claude API error: {str(e)[:100]}")
         return None
+    finally:
+        # Ensure alarm is cancelled
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
 
 # one-time session flag so we don't open multiple tabs on reruns
 if "opened_report_id" not in st.session_state:
@@ -97,84 +120,195 @@ from datetime import datetime
 # ------------------------ Page & Config ------------------------
 st.set_page_config(page_title="Face Value Audit", layout="wide")
 
-# Hide Streamlit watermark and enforce white theme
+# Modern mobile-first UI styling
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    /* Force white theme */
+    /* Mobile-first responsive design */
     .stApp {
-        background-color: white !important;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+        min-height: 100vh;
     }
 
+    /* Reduce padding and margins for mobile */
     .main .block-container {
-        background-color: white !important;
+        padding-top: 1rem !important;
+        padding-bottom: 1rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        max-width: 100% !important;
     }
 
-    /* Force white background for all elements */
-    .stSelectbox > div > div,
+    /* Card-like containers for form sections */
+    .stForm {
+        background: rgba(255, 255, 255, 0.95) !important;
+        border-radius: 20px !important;
+        padding: 1.5rem !important;
+        margin: 0.5rem 0 !important;
+        box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37) !important;
+        backdrop-filter: blur(8px) !important;
+        border: 1px solid rgba(255, 255, 255, 0.18) !important;
+    }
+
+    /* Input styling */
     .stTextInput > div > div > input,
-    .stTextArea > div > div > textarea,
-    .stButton > button,
-    .stForm,
-    .stDataFrame,
-    .stTable,
-    .stMetric,
-    .stAlert,
-    .stSidebar .block-container {
-        background-color: white !important;
-        color: black !important;
+    .stSelectbox > div > div,
+    .stTextArea > div > div > textarea {
+        background: rgba(255, 255, 255, 0.9) !important;
+        border: 1px solid rgba(102, 126, 234, 0.3) !important;
+        border-radius: 12px !important;
+        color: #333 !important;
+        font-size: 16px !important; /* Prevents zoom on mobile */
+        padding: 0.75rem !important;
+        transition: all 0.3s ease !important;
     }
 
-    /* Sidebar white theme */
+    .stTextInput > div > div > input:focus,
+    .stSelectbox > div > div:focus,
+    .stTextArea > div > div > textarea:focus {
+        border-color: #667eea !important;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1) !important;
+        outline: none !important;
+    }
+
+    /* Button styling */
+    .stButton > button {
+        background: linear-gradient(45deg, #667eea, #764ba2) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 15px !important;
+        padding: 0.75rem 2rem !important;
+        font-weight: 600 !important;
+        font-size: 16px !important;
+        transition: all 0.3s ease !important;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4) !important;
+        width: 100% !important;
+    }
+
+    .stButton > button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6) !important;
+    }
+
+    .stButton > button:active {
+        transform: translateY(0) !important;
+    }
+
+    /* Form submit button special styling */
+    .stForm > button[type="submit"] {
+        background: linear-gradient(45deg, #11998e, #38ef7d) !important;
+        font-size: 18px !important;
+        padding: 1rem 2rem !important;
+        margin-top: 1rem !important;
+    }
+
+    /* Labels and text */
+    label {
+        color: #333 !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        margin-bottom: 0.5rem !important;
+    }
+
+    /* Headers */
+    h1 {
+        color: white !important;
+        text-align: center !important;
+        font-weight: 700 !important;
+        text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3) !important;
+        margin-bottom: 2rem !important;
+    }
+
+    h2, h3, h4 {
+        color: #333 !important;
+        font-weight: 600 !important;
+    }
+
+    /* Compact spacing */
+    .stTextInput, .stSelectbox, .stTextArea {
+        margin-bottom: 0.5rem !important;
+    }
+
+    /* Column spacing */
+    .stColumn {
+        padding: 0.25rem !important;
+    }
+
+    /* Sidebar compact */
     .stSidebar {
-        background-color: white !important;
+        background: rgba(255, 255, 255, 0.95) !important;
+        backdrop-filter: blur(10px) !important;
     }
 
-    /* Input fields */
-    input, textarea, select {
-        background-color: white !important;
-        color: black !important;
-        border: 1px solid #ddd !important;
+    .stSidebar .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 1rem !important;
     }
 
-    /* Text colors */
-    h1, h2, h3, h4, h5, h6, p, span, div, label {
-        color: black !important;
+    /* Mobile optimizations */
+    @media (max-width: 768px) {
+        .main .block-container {
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+        }
+
+        .stForm {
+            padding: 1rem !important;
+            border-radius: 15px !important;
+        }
+
+        h1 {
+            font-size: 2rem !important;
+        }
+
+        .stButton > button {
+            font-size: 16px !important;
+            padding: 0.75rem !important;
+        }
     }
 
-    /* Remove any dark theme artifacts */
-    [data-testid="stAppViewContainer"] {
-        background-color: white !important;
+    /* Tablet optimizations */
+    @media (min-width: 769px) and (max-width: 1024px) {
+        .main .block-container {
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+        }
     }
 
-    [data-testid="stHeader"] {
-        background-color: white !important;
-    }
-
-    /* Hide Streamlit watermark/footer */
-    footer {
-        visibility: hidden !important;
-    }
-
-    footer:after {
-        content:'';
-        visibility: visible;
-        display: block;
-        position: relative;
-        background-color: white;
-        padding: 5px;
-        top: 2px;
-    }
-
-    /* Alternative method - hide specific watermark elements */
+    /* Hide Streamlit elements */
     [data-testid="stDecoration"],
     [data-testid="stStatusWidget"],
     .reportview-container .main footer,
     .streamlit-footer {
         display: none !important;
+    }
+
+    /* Spinner positioning for mobile */
+    .stSpinner {
+        position: fixed !important;
+        top: 20px !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        z-index: 9999 !important;
+        background: rgba(255, 255, 255, 0.9) !important;
+        padding: 1rem 2rem !important;
+        border-radius: 25px !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
+    }
+
+    /* Caption text */
+    .stCaption {
+        color: #666 !important;
+        font-size: 12px !important;
+    }
+
+    /* Success/warning messages */
+    .stAlert {
+        border-radius: 12px !important;
+        margin: 0.5rem 0 !important;
     }
     </style>
 """
@@ -198,16 +332,9 @@ if st.session_state.get('report_ready', False):
 
     # Add footer below the Run Another Audit button
     st.markdown("---")
-    # Read logo for footer
-    with open("assets/logo-big.png", "rb") as footer_logo_file:
-        footer_logo_base64 = base64.b64encode(footer_logo_file.read()).decode()
-
-    st.markdown(f"""
+    st.markdown("""
     <div style="text-align: center; padding: 2rem 0; background: linear-gradient(90deg, #f8f9fa 0%, #ffffff 50%, #f8f9fa 100%); border-radius: 10px; margin-top: 3rem;">
-        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 1rem;">
-            <img src="data:image/png;base64,{footer_logo_base64}" width="40" style="margin-right: 10px;">
-            <h4 style="margin: 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
-        </div>
+        <h4 style="margin: 0 0 1rem 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
         <p style="color: #666; margin: 0; font-size: 0.9rem;">Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
         <p style="color: #999; margin: 0.5rem 0 0 0; font-size: 0.8rem;">© 2025 Needle Tail. All rights reserved.</p>
     </div>
@@ -1435,100 +1562,61 @@ def run_async_llm_analysis(prompts_dict: dict):
 
 # Streaming and progress support
 def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews):
-    """Stream LLM analysis with real-time progress updates"""
+    """Streamlined LLM analysis with timeout protection"""
     if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
         return None
 
-    # Create progress container
-    progress_container = st.empty()
-    status_container = st.empty()
-    start_time = time.time()
-
     try:
-        # Step 1: Check cache
-        progress_container.progress(10, "Checking cache...")
+        # Quick cache check
         cache_key = hashlib.md5(f"{website_url}_{practice_name}_{len(reviews or [])}".encode()).hexdigest()
         cached_result = _advanced_cache.get(cache_key)
         if cached_result:
-            progress_container.progress(100, "Analysis complete (cached)")
-            time.sleep(0.5)  # Brief display
-            progress_container.empty()
-            status_container.empty()
             return cached_result
 
-        # Step 2: Data preparation
-        progress_container.progress(25, "Preparing data...")
-        page_text = soup.get_text(" ", strip=True)[:2500]
+        # Fast data preparation
+        page_text = soup.get_text(" ", strip=True)[:1500]  # Reduced from 2500
         links = [a.get("href") or "" for a in soup.find_all("a", href=True)]
-        social_links = [l for l in links[:30] if any(platform in l.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])]
+        social_links = [l for l in links[:15] if any(platform in l.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])][:3]  # Limit to 3
 
-        # Step 3: Content analysis
-        progress_container.progress(40, "Analyzing content...")
-        img_count = len(soup.find_all("img"))
-        vid_count = len(soup.find_all(["video", "source"]))
-
-        # Step 4: Review processing
-        progress_container.progress(55, "Processing reviews...")
-        review_texts = []
-        for review in (reviews or [])[:5]:
-            text = review.get("text", "").strip()
-            if text:
-                review_texts.append(text[:200])
-        reviews_context = " | ".join(review_texts) if review_texts else "No reviews available"
-
-        # Step 5: LLM Analysis
-        progress_container.progress(70, "Running AI analysis...")
-
-        # Create comprehensive prompt
+        # Simplified prompt for faster processing
         prompt = f"""
-        You are an expert Online Marketing professional specializing in dental practices. Analyze this dental practice website comprehensively and return a JSON response with actionable marketing insights:
+        Analyze this dental practice website and return JSON with marketing insights:
 
         Practice: {practice_name or "Dental Practice"}
         Website: {website_url}
-        Content: {page_text[:800]}...
+        Content: {page_text[:600]}...
+        Social Links: {social_links}
 
-        Social Media Links Found: {social_links[:5]}
-        Visual Content: {img_count} images, {vid_count} videos
-        Sample Reviews: {reviews_context[:500]}
-
-        Return JSON with ALL sections:
+        Return JSON:
         {{
             "social_media": {{
                 "platforms": ["Facebook", "Instagram", "Twitter", "Yelp"],
                 "links": {{"Facebook": "url_or_null", "Instagram": "url_or_null", "Twitter": "url_or_null", "Yelp": "url_or_null"}},
                 "advice": "Brief social media strategy advice",
-                "visibility_insights": "• Implement local SEO with city + dentist keywords\\n• Create Google My Business posts weekly\\n• Build local directory citations"
+                "visibility_insights": "• Optimize Google My Business\\n• Add location-based keywords\\n• Build online directory listings"
             }},
             "reputation": {{
-                "sentiment": "Overall review sentiment summary",
-                "positive_themes": "Top positive themes (comma-separated)",
+                "sentiment": "Review sentiment summary",
+                "positive_themes": "Top positive themes",
                 "negative_themes": "Top negative themes or 'None detected'",
                 "advice": "Brief reputation management advice"
             }},
             "marketing": {{
                 "content_quality": "Website content assessment",
-                "visual_effectiveness": "Photo/video marketing assessment",
                 "key_recommendations": "Top 3 marketing improvements",
                 "advertising_advice": "Marketing tools recommendation"
             }}
         }}
 
-        CRITICAL REQUIREMENTS:
-        1. For visibility_insights: Provide exactly 3 actionable bullet points formatted as "• Point 1\\n• Point 2\\n• Point 3"
-        2. Each bullet point should be specific, actionable advice a dental practice can implement immediately
-        3. Focus on: local SEO, Google My Business, online directories, website optimization, social media presence
-        4. Act as an expert marketing consultant - give professional, practical advice
-        5. Keep bullet points under 60 characters each for clear display
-
-        For social media links, only include actual practice profile URLs, not general pages or sharing widgets.
+        Keep it concise and actionable.
         """
 
-        response_text = call_claude_api(prompt)
+        # Call API with shorter timeout
+        response_text = call_claude_api(prompt, timeout=15)  # Reduced from 30
         if not response_text:
             return None
 
-        # Step 6: Processing results
-        progress_container.progress(90, "Processing results...")
+        # Fast JSON parsing
         response_text = response_text.strip()
         if "```json" in response_text:
             json_text = response_text.split("```json")[1].split("```")[0].strip()
@@ -1537,28 +1625,12 @@ def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews)
 
         result = json.loads(json_text)
 
-        # Step 7: Caching
-        progress_container.progress(95, "Caching results...")
+        # Cache results
         _advanced_cache.put(cache_key, result)
-
-        # Complete
-        elapsed_time = time.time() - start_time
-        progress_container.progress(100, f"Analysis complete! ({elapsed_time:.1f}s)")
-        time.sleep(1.0)  # Show completion message briefly
-        progress_container.empty()
-        status_container.empty()
-
-        # Log performance for monitoring
-        if elapsed_time > 30:  # Alert if analysis takes too long
-            st.sidebar.warning(f"⚡ LLM analysis took {elapsed_time:.1f}s - consider optimization")
-
         return result
 
     except Exception as e:
-        progress_container.empty()
-        status_container.error(f"AI analysis failed: {str(e)[:100]}")
-        time.sleep(2.0)  # Show error briefly
-        status_container.empty()
+        # Return None on any error - the app will continue with basic analysis
         return None
 
 def extract_social_media_with_llm(links, soup):
@@ -3018,101 +3090,122 @@ def build_static_report_html(final, overview, visibility, reputation, marketing,
 
 
 
-# ---- Single form layout ----
-st.subheader("Enter Practice Details")
+# ---- Modern Mobile-Friendly Form Layout ----
+st.markdown("""
+<div style="text-align: center; margin-bottom: 2rem;">
+    <h2 style="color: white; font-size: 1.8rem; margin: 0;">🦷 Practice Details</h2>
+    <p style="color: rgba(255,255,255,0.8); font-size: 0.9rem; margin-top: 0.5rem;">Enter your practice information to get started</p>
+</div>
+""", unsafe_allow_html=True)
 
-# All inputs outside the form for real-time updates and prefill functionality
+# Create columns for better mobile layout
+col1, col2 = st.columns([1, 1])
 
-# 1. Website URL
-website = st.text_input(
-    "Website URL *",
-    key="website_input",
-    value=st.session_state.draft.get("website", ""),
-    placeholder="https://example.com"
-)
+with col1:
+    # 1. Website URL
+    website = st.text_input(
+        "🌐 Website URL *",
+        key="website_input",
+        value=st.session_state.draft.get("website", ""),
+        placeholder="https://yourpractice.com",
+        help="Enter your practice website URL"
+    )
+
+    # 2. Practice's Name
+    practice_name_value = st.session_state.draft.get("practice_name", "")
+    name_message = st.session_state.draft.get("name_message", "")
+
+    practice_name = st.text_input(
+        "🏢 Practice Name *",
+        value=practice_name_value,
+        key="practice_name_input",
+        placeholder="Smile Dental Care",
+        help="Your practice or clinic name"
+    )
+
+
+    # 3. Contact Person/ Doctor Name
+    doctor_name = st.text_input(
+        "👨‍⚕️ Doctor/Contact Name *",
+        key="doctor_name_input",
+        value=st.session_state.draft.get("doctor_name", ""),
+        placeholder="Dr. John Smith",
+        help="Primary contact or lead doctor"
+    )
+
+with col2:
+    # 4. Email ID (with prefill messages)
+    email_value = st.session_state.draft.get("email", "")
+    email_message = st.session_state.draft.get("email_message", "")
+
+    email = st.text_input(
+        "📧 Email Address *",
+        value=email_value,
+        key="email_input",
+        placeholder="contact@yourpractice.com",
+        help="Primary contact email"
+    )
+
+
+    # 5. Phone Number (with prefill messages)
+    phone_value = st.session_state.draft.get("phone", "")
+    phone_message = st.session_state.draft.get("phone_message", "")
+
+    phone = st.text_input(
+        "📞 Phone Number *",
+        value=phone_value,
+        key="phone_input",
+        placeholder="+1 (555) 123-4567",
+        help="Primary contact phone number"
+    )
+
 
 # Auto-prefill functionality when website URL changes
 if website and website != st.session_state.get("last_prefill_website", ""):
     normalized_website = _normalize_url(website)
     if normalized_website and normalized_website != st.session_state.get("last_prefill_website", ""):
         st.session_state.last_prefill_website = normalized_website
-        with st.spinner("Fetching practice details from website..."):
-            prefill_from_website(normalized_website)
-            st.session_state.last_fetched_website = normalized_website
-            st.rerun()
 
-# 2. Contact Person/ Name of the Doctor
-doctor_name = st.text_input(
-    "Contact Person/ Name of the Doctor *",
-    key="doctor_name_input",
-    value=st.session_state.draft.get("doctor_name", ""),
-    placeholder="Dr. John Smith"
-)
+        # Create a top-positioned spinner container
+        spinner_container = st.empty()
+        with spinner_container:
+            st.markdown("""
+            <div style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+                        z-index: 9999; background: rgba(255, 255, 255, 0.95);
+                        padding: 1rem 2rem; border-radius: 25px;
+                        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                        border: 1px solid rgba(102, 126, 234, 0.3);">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div style="width: 20px; height: 20px; border: 3px solid #667eea;
+                               border-top: 3px solid transparent; border-radius: 50%;
+                               animation: spin 1s linear infinite;"></div>
+                    <span style="color: #333; font-weight: 600;">🔍 Analyzing website...</span>
+                </div>
+            </div>
+            <style>
+                @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            </style>
+            """, unsafe_allow_html=True)
 
-# 3. Email ID (with prefill messages)
-email_value = st.session_state.draft.get("email", "")
-email_message = st.session_state.draft.get("email_message", "")
+        prefill_from_website(normalized_website)
+        st.session_state.last_fetched_website = normalized_website
+        spinner_container.empty()
+        st.rerun()
 
-email = st.text_input(
-    "Email ID *",
-    value=email_value,
-    key="email_input",
-    placeholder="contact@example.com"
-)
-
-if email_value and not email_message:
-    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
-elif email_message:
-    st.caption(f"ℹ️ {email_message}")
-
-# 4. Phone Number (with prefill messages)
-phone_value = st.session_state.draft.get("phone", "")
-phone_message = st.session_state.draft.get("phone_message", "")
-
-phone = st.text_input(
-    "Phone Number *",
-    value=phone_value,
-    key="phone_input",
-    placeholder="+1-555-123-4567"
-)
-
-if phone_value and not phone_message:
-    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
-elif phone_message:
-    st.caption(f"ℹ️ {phone_message}")
-
-# 5. Practice's Name (with prefill messages)
-practice_name_value = st.session_state.draft.get("practice_name", "")
-name_message = st.session_state.draft.get("name_message", "")
-
-practice_name = st.text_input(
-    "Practice's Name *",
-    value=practice_name_value,
-    key="practice_name_input",
-    placeholder="Smith Family Dentistry"
-)
-
-if practice_name_value and not name_message:
-    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
-elif name_message:
-    st.caption(f"ℹ️ {name_message}")
-
-# 6. Full Address (with prefill messages)
+# Address field spans both columns
+st.markdown("---")
 address_value = st.session_state.draft.get("address", "")
 address_message = st.session_state.draft.get("address_message", "")
 
 address = st.text_area(
-    "Full Address *",
+    "🏠 Full Practice Address *",
     value=address_value,
-    height=80,
+    height=60,
     key="address_input",
-    placeholder="123 Main Street, City, State, ZIP Code"
+    placeholder="123 Main Street, City, State, ZIP Code",
+    help="Complete address including street, city, state, and ZIP code"
 )
 
-if address_value and not address_message:
-    st.caption("📝 Data extracted from website. Kindly verify/edit before submitting.")
-elif address_message:
-    st.caption(f"ℹ️ {address_message}")
 
 # Show helpful tip for blocked websites
 if (st.session_state.get("last_fetch_error") == "blocked" and
@@ -3157,6 +3250,10 @@ with col2:
     if address and not address_ok:
         st.caption("⚠️ Full address is required.")
 
+# Add note about extracted data
+st.markdown("---")
+st.info("ℹ️ **Note**: Some details may have been extracted from the website. Please recheck/edit before submitting.")
+
 # Form with only the submit button
 with st.form("practice_details_form", clear_on_submit=False):
     # Submit button
@@ -3189,14 +3286,11 @@ with st.form("practice_details_form", clear_on_submit=False):
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; padding: 2rem 0; background: linear-gradient(90deg, #f8f9fa 0%, #ffffff 50%, #f8f9fa 100%); border-radius: 10px; margin-top: 3rem;">
-    <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 1rem;">
-        <img src="data:image/png;base64,{}" width="40" style="margin-right: 10px;">
-        <h4 style="margin: 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
-    </div>
+    <h4 style="margin: 0 0 1rem 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
     <p style="color: #666; margin: 0; font-size: 0.9rem;">Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
     <p style="color: #999; margin: 0.5rem 0 0 0; font-size: 0.8rem;">© 2025 Needle Tail. All rights reserved.</p>
 </div>
-""".format(logo_base64), unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
 
@@ -3917,29 +4011,73 @@ if st.session_state.submitted:
     address     = st.session_state.final.get("address")
     phone       = st.session_state.final.get("phone")
     website     = st.session_state.final.get("website")
-    # ... continue your existing audit pipeline ...
-    #  ------------------------ Run audit ------------------------
-    soup, load_time = fetch_html(website)
-    place_id = find_best_place_id(clinic_name, address, website)
-    details = places_details(place_id) if place_id else None
 
-    
+    # Clear the page and show top-positioned progress indicator
+    st.empty()
+
+    # Create top-positioned spinner
+    progress_container = st.empty()
+    with progress_container:
+        st.markdown("""
+        <div style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+                    z-index: 9999; background: rgba(255, 255, 255, 0.95);
+                    padding: 1.5rem 3rem; border-radius: 30px;
+                    box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+                    backdrop-filter: blur(8px);
+                    border: 1px solid rgba(255, 255, 255, 0.18);">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <div style="width: 30px; height: 30px; border: 4px solid #667eea;
+                           border-top: 4px solid transparent; border-radius: 50%;
+                           animation: spin 1s linear infinite;"></div>
+                <div>
+                    <div style="color: #333; font-weight: 700; font-size: 16px;">🔍 Analyzing Practice</div>
+                    <div style="color: #666; font-size: 12px; margin-top: 2px;">Generating comprehensive audit report...</div>
+                </div>
+            </div>
+        </div>
+        <style>
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        </style>
+        """, unsafe_allow_html=True)
+
+    # Initialize variables with fallback values
+    soup = None
+    load_time = 0
+    place_id = None
+    details = None
+    comprehensive_analysis = None
     final = st.session_state.final
 
-    # Show processing message
-    # st.info("🔄 Generating your comprehensive audit report...")
+    # Start timer for timeout protection
+    audit_start_time = time.time()
+    AUDIT_TIMEOUT = 60  # 60 seconds maximum
 
-    with st.spinner("Analyzing your practice's online presence..."):
+    try:
+        # Step 1: Fetch website HTML with timeout
+        with st.spinner("Fetching website..."):
+            soup, load_time = fetch_html(website)
 
-        # Initialize comprehensive analysis with streaming progress
-        st.write("🤖 **AI Analysis in Progress**")
-        comprehensive_analysis = None
-        if HAS_CLAUDE and CLAUDE_API_KEY and soup:
-            try:
-                comprehensive_analysis = stream_llm_analysis_with_progress(soup, website, clinic_name, [])
-            except Exception as e:
-                st.warning(f"AI analysis unavailable: {str(e)[:100]}")
+        # Step 2: Get Google Places data with timeout
+        if time.time() - audit_start_time < AUDIT_TIMEOUT:
+            with st.spinner("Analyzing location..."):
+                place_id = find_best_place_id(clinic_name, address, website)
+                details = places_details(place_id) if place_id else None
 
+        # Step 3: Run LLM analysis with timeout
+        if time.time() - audit_start_time < AUDIT_TIMEOUT and HAS_CLAUDE and CLAUDE_API_KEY and soup:
+            with st.spinner("Running AI analysis..."):
+                try:
+                    comprehensive_analysis = stream_llm_analysis_with_progress(soup, website, clinic_name, [])
+                except Exception as e:
+                    st.warning(f"AI analysis failed: {str(e)[:100]}. Continuing with basic analysis...")
+        elif time.time() - audit_start_time >= AUDIT_TIMEOUT:
+            st.warning("⚠️ Analysis timeout reached. Generating report with available data...")
+
+    except Exception as e:
+        st.error(f"Error during analysis: {str(e)[:100]}. Generating report with available data...")
+        # Continue with fallback values
+
+    try:
         # 1) Overview
         overview = {
             "Practice Name": clinic_name or "Search limited",
@@ -3974,26 +4112,26 @@ if st.session_state.submitted:
 
         gbp_score = "Search limited"; gbp_signals = "Search limited"
         if details and details.get("status") == "OK":
-            res = details["result"]; score = 0; checks = []
-            if res.get("opening_hours"): score += 20; checks.append("Hours ✅")
-            else: checks.append("Hours ❌")
-            if res.get("photos"): score += 20; checks.append(f"Photos ✅ ({len(res.get('photos',[]))})")
-            else: checks.append("Photos ❌ (0)")
-            if res.get("website"): score += 15; checks.append("Website ✅")
-            else: checks.append("Website ❌")
-            if res.get("international_phone_number"): score += 15; checks.append("Phone ✅")
-            else: checks.append("Phone ❌")
-            if res.get("rating") and res.get("user_ratings_total",0)>0: score += 10; checks.append("Reviews ✅")
-            else: checks.append("Reviews ❌")
-            if "dentist" in res.get("types", []) or "dental_clinic" in res.get("types", []):
-                score += 10; checks.append("Category ✅")
-            else:
-                checks.append("Category ❌")
-            if res.get("formatted_address"): score += 10; checks.append("Address ✅")
-            else:
-                checks.append("Address ❌")
-            gbp_score = f"{min(score,100)}/100"
-            gbp_signals = " | ".join(checks)
+                res = details["result"]; score = 0; checks = []
+                if res.get("opening_hours"): score += 20; checks.append("Hours ✅")
+                else: checks.append("Hours ❌")
+                if res.get("photos"): score += 20; checks.append(f"Photos ✅ ({len(res.get('photos',[]))})")
+                else: checks.append("Photos ❌ (0)")
+                if res.get("website"): score += 15; checks.append("Website ✅")
+                else: checks.append("Website ❌")
+                if res.get("international_phone_number"): score += 15; checks.append("Phone ✅")
+                else: checks.append("Phone ❌")
+                if res.get("rating") and res.get("user_ratings_total",0)>0: score += 10; checks.append("Reviews ✅")
+                else: checks.append("Reviews ❌")
+                if "dentist" in res.get("types", []) or "dental_clinic" in res.get("types", []):
+                    score += 10; checks.append("Category ✅")
+                else:
+                    checks.append("Category ❌")
+                if res.get("formatted_address"): score += 10; checks.append("Address ✅")
+                else:
+                    checks.append("Address ❌")
+                gbp_score = f"{min(score,100)}/100"
+                gbp_signals = " | ".join(checks)
 
         # Get AI insights for online visibility
         visibility_ai_insights = ""
@@ -4001,42 +4139,42 @@ if st.session_state.submitted:
             insights = comprehensive_analysis["social_media"]["visibility_insights"]
             # Format as bullet points for dataframe display
             if isinstance(insights, str):
-                # Clean up the insights string and ensure proper bullet point formatting
-                insights = insights.strip()
+                    # Clean up the insights string and ensure proper bullet point formatting
+                    insights = insights.strip()
 
-                # If insights already contain bullet points, use them directly
-                if "•" in insights and "\\n" in insights:
-                    # Replace escaped newlines with actual newlines
-                    visibility_ai_insights = insights.replace("\\n", "\n")
-                elif "•" in insights:
-                    # Split by bullet points and rejoin with newlines
-                    bullet_parts = insights.split("•")
-                    bullet_points = []
-                    for part in bullet_parts:
-                        part = part.strip()
-                        if part and len(part) > 5:
-                            bullet_points.append(f"• {part}")
-                    visibility_ai_insights = "\n".join(bullet_points[:3])
-                else:
-                    # Split by common delimiters and format as bullets
-                    bullet_points = []
-                    if "-" in insights:
-                        lines = insights.split("-")
-                    elif "." in insights:
-                        lines = insights.split(".")
+                    # If insights already contain bullet points, use them directly
+                    if "•" in insights and "\\n" in insights:
+                        # Replace escaped newlines with actual newlines
+                        visibility_ai_insights = insights.replace("\\n", "\n")
+                    elif "•" in insights:
+                        # Split by bullet points and rejoin with newlines
+                        bullet_parts = insights.split("•")
+                        bullet_points = []
+                        for part in bullet_parts:
+                            part = part.strip()
+                            if part and len(part) > 5:
+                                bullet_points.append(f"• {part}")
+                        visibility_ai_insights = "\n".join(bullet_points[:3])
                     else:
-                        lines = [insights]
+                        # Split by common delimiters and format as bullets
+                        bullet_points = []
+                        if "-" in insights:
+                            lines = insights.split("-")
+                        elif "." in insights:
+                            lines = insights.split(".")
+                        else:
+                            lines = [insights]
 
-                    for line in lines:
-                        line = line.strip()
-                        if line and len(line) > 5:  # Skip very short fragments
-                            bullet_points.append(f"• {line}")
+                        for line in lines:
+                            line = line.strip()
+                            if line and len(line) > 5:  # Skip very short fragments
+                                bullet_points.append(f"• {line}")
 
-                    visibility_ai_insights = "\n".join(bullet_points[:3])  # Limit to 3 points
+                        visibility_ai_insights = "\n".join(bullet_points[:3])  # Limit to 3 points
 
-                # Fallback to default insights if nothing was extracted
-                if not visibility_ai_insights.strip():
-                    visibility_ai_insights = "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
+                    # Fallback to default insights if nothing was extracted
+                    if not visibility_ai_insights.strip():
+                        visibility_ai_insights = "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
 
         visibility = {
             "GBP Completeness (estimate)": gbp_score,
@@ -4176,3 +4314,15 @@ if st.session_state.submitted:
 
         # Trigger a rerun to display the report at the top
         st.rerun()
+
+    except Exception as e:
+        st.error(f"Report generation failed: {str(e)[:100]}")
+    finally:
+        # Always clear the progress indicator
+        try:
+            progress_container.empty()
+        except:
+            pass
+
+
+
