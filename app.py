@@ -14,6 +14,19 @@ from functools import lru_cache
 import base64, json, hashlib
 import streamlit.components.v1 as components
 
+# For PDF Export - using native Python libraries
+from io import BytesIO
+try:
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+
 # For LLM-based social media analysis
 try:
     import anthropic
@@ -116,6 +129,469 @@ import gspread
 from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo  # stdlib; for IST timestamp if you later want it
 from datetime import datetime
+
+# ------------------------ PDF Generation Function ------------------------
+
+def generate_pdf_report(final_data, overview, visibility, reputation, marketing, experience, scores, reviews, website_url):
+    """Generate PDF from report data using reportlab"""
+    if not HAS_REPORTLAB:
+        return None
+
+    try:
+        # Import needed functions for PDF generation
+        from html import escape
+        # Clean up the website URL for filename
+        clean_url = re.sub(r'[^\w\-_.]', '_', website_url.replace('https://', '').replace('http://', '').replace('www.', ''))
+        filename = f"face_value_audit_{clean_url}_{int(time.time())}.pdf"
+
+        # Create PDF in memory
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch)
+
+        # Get styles
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            alignment=TA_CENTER,
+            textColor=colors.black,
+            spaceAfter=20
+        )
+
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=16,
+            textColor=colors.HexColor('#2c3e50'),
+            spaceBefore=15,
+            spaceAfter=10
+        )
+
+        normal_style = ParagraphStyle(
+            'CustomNormal',
+            parent=styles['Normal'],
+            fontSize=10,
+            spaceBefore=5,
+            spaceAfter=5
+        )
+
+        # Build content
+        content = []
+
+        # Title
+        content.append(Paragraph("Face Value Audit Report", title_style))
+        content.append(Spacer(1, 0.2*inch))
+
+        # Website info
+        content.append(Paragraph(f"<b>Website:</b> {final_data.get('website', 'N/A')}", normal_style))
+        content.append(Paragraph(f"<b>Doctor:</b> {final_data.get('doctor_name', 'N/A')}", normal_style))
+        content.append(Paragraph(f"<b>Practice:</b> {final_data.get('practice_name', 'N/A')}", normal_style))
+        content.append(Spacer(1, 0.2*inch))
+
+        # Create table cell style for text wrapping
+        table_cell_style = ParagraphStyle(
+            'TableCell',
+            parent=styles['Normal'],
+            fontSize=9,
+            leading=11,  # Line spacing
+            spaceBefore=3,
+            spaceAfter=3,
+            leftIndent=3,
+            rightIndent=3
+        )
+
+        # Add sections with data
+        def add_section(title, data_dict):
+            content.append(Paragraph(title, heading_style))
+            if data_dict:
+                table_data = []
+                for key, value in data_dict.items():
+                    # Convert all values to strings and handle None values
+                    value_str = str(value) if value else "—"
+
+                    # Clean up HTML tags for PDF
+                    if isinstance(value, str) and '<a href=' in value:
+                        # Extract just the text content from HTML links
+                        soup_temp = BeautifulSoup(value, 'html.parser')
+                        value_str = soup_temp.get_text()
+
+                    # Handle very long text - break into multiple lines for better readability
+                    if len(value_str) > 300:
+                        # Split very long text at sentence boundaries
+                        sentences = value_str.split('. ')
+                        if len(sentences) > 1:
+                            # Rejoin with line breaks for better PDF formatting
+                            value_str = '.<br/>'.join(sentences[:3])  # Limit to first 3 sentences
+                            if len(sentences) > 3:
+                                value_str += "...<br/><i>(truncated for PDF readability)</i>"
+                        else:
+                            # If no sentences, just truncate
+                            value_str = value_str[:300] + "...<br/><i>(truncated for PDF readability)</i>"
+
+                    # Escape HTML entities and preserve some basic formatting
+                    key_str = escape(str(key))
+                    value_str_escaped = escape(value_str).replace('&lt;br/&gt;', '<br/>')
+                    value_str_escaped = value_str_escaped.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+
+                    # Create Paragraph objects for proper text wrapping
+                    key_paragraph = Paragraph(key_str, table_cell_style)
+                    value_paragraph = Paragraph(value_str_escaped, table_cell_style)
+
+                    table_data.append([key_paragraph, value_paragraph])
+
+                if table_data:
+                    # Create table with automatic row heights for text wrapping
+                    t = Table(table_data, colWidths=[2*inch, 4*inch], repeatRows=0)
+                    t.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f2f2f2')),
+                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),  # Align to top for better readability
+                        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                        ('FONTSIZE', (0, 0), (-1, -1), 9),
+                        ('TOPPADDING', (0, 0), (-1, -1), 8),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e8e8e8')),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                        ('WORDWRAP', (0, 0), (-1, -1), 'CJK'),  # Enable word wrapping
+                        ('SPANBEFORE', (0, 0), (-1, -1), 'WORD'),  # Better word breaks
+                    ]))
+                    content.append(t)
+            content.append(Spacer(1, 0.1*inch))
+
+        # Add all sections
+        if overview:
+            add_section("Website Overview", overview)
+        if visibility:
+            add_section("Online Visibility", visibility)
+        if reputation:
+            add_section("Reputation & Feedback", reputation)
+        if marketing:
+            add_section("Marketing Signals", marketing)
+        if experience:
+            add_section("Patient Experience", experience)
+
+        # Add scores if available
+        if scores:
+            content.append(Paragraph("Assessment Scores", heading_style))
+            score_data = []
+            for key, value in scores.items():
+                denominator = 30 if key == 'visibility' else 40 if key == 'reputation' else 30 if key == 'experience' else 100
+                score_value = f"{value}/{denominator}" if isinstance(value, (int, float)) else str(value)
+
+                # Create Paragraph objects for scores table too
+                key_paragraph = Paragraph(escape(str(key)), table_cell_style)
+                score_paragraph = Paragraph(escape(score_value), table_cell_style)
+                score_data.append([key_paragraph, score_paragraph])
+
+            if score_data:
+                # Create scores table with text wrapping
+                t = Table(score_data, colWidths=[3*inch, 1*inch], repeatRows=0)
+                t.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f2f2f2')),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 10),
+                    ('TOPPADDING', (0, 0), (-1, -1), 8),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('WORDWRAP', (0, 0), (-1, -1), 'CJK'),  # Enable word wrapping
+                    ('SPANBEFORE', (0, 0), (-1, -1), 'WORD'),  # Better word breaks
+                ]))
+                content.append(t)
+            content.append(Spacer(1, 0.2*inch))
+
+        # Add footer
+        content.append(Spacer(1, 0.3*inch))
+        footer_style = ParagraphStyle(
+            'Footer',
+            parent=styles['Normal'],
+            fontSize=8,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor('#666666')
+        )
+        content.append(Paragraph("Powered by Needle Tail", footer_style))
+        content.append(Paragraph("Experience the future of healthcare eligibility verification with AI agents that work 24/7.", footer_style))
+        content.append(Paragraph("© 2025 Needle Tail. All rights reserved.", footer_style))
+
+        # Build PDF
+        doc.build(content)
+        pdf_bytes = buffer.getvalue()
+        buffer.close()
+
+        return pdf_bytes, filename
+
+    except Exception as e:
+        st.error(f"Error generating PDF: {str(e)}")
+        return None
+
+# ------------------------ Display Functions ------------------------
+
+def display_native_report(final, overview, visibility, reputation, marketing, experience, scores, reviews):
+    """Display report using native Streamlit elements"""
+
+    # Title and header with compact design
+    st.markdown("""
+    <div style="text-align: center; padding: 1.5rem 1rem; background: white; border: 2px solid #e8f4fd; border-radius: 12px; margin-bottom: 1.5rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+        <h1 style="color: #000000; margin: 0; font-size: 2.2rem; font-weight: 700; font-family: 'Segoe UI', system-ui, sans-serif;">Face Value Audit Report</h1>
+        <p style="color: #4a90c2; margin: 0.5rem 0 0 0; font-size: 1rem; font-weight: 500;">Powered by NeedletailAI</p>
+        <div style="width: 60px; height: 3px; background: linear-gradient(90deg, #1f4e79 0%, #4a90c2 100%); margin: 0.8rem auto 0; border-radius: 2px;"></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Website overview section with enhanced styling
+    col1, col2 = st.columns([2, 1], gap="large")
+
+    with col1:
+        st.markdown("""
+        <div style="background: white; padding: 1rem; border-radius: 10px; border-left: 4px solid #1f4e79; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 0.8rem;">
+            <h3 style="color: #1f4e79; margin: 0 0 0.8rem 0; font-size: 1.3rem; display: flex; align-items: center;">
+                🌐 Website Overview
+            </h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if final:
+            # Create compact info cards
+            info_items = [
+                ("🌍 Website", final.get('website', 'N/A')),
+                ("👨‍⚕️ Doctor Name", final.get('doctor_name', 'N/A')),
+                ("🏥 Practice Name", final.get('practice_name', 'N/A')),
+                ("📧 Email", final.get('email', '')),
+                ("📞 Phone", final.get('phone', '')),
+                ("📍 Address", final.get('address', ''))
+            ]
+
+            for icon_label, value in info_items:
+                if value:  # Only show if value exists
+                    st.markdown(f"""
+                    <div style="background: #f8fbff; padding: 0.6rem; margin: 0.3rem 0; border-radius: 6px; border-left: 3px solid #4a90c2;">
+                        <strong style="color: #1f4e79; font-size: 0.9rem;">{icon_label}:</strong>
+                        <span style="color: #333; margin-left: 0.5rem; font-size: 0.9rem;">{value}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+    with col2:
+        # Display scores with compact styling
+        if scores:
+            st.markdown("""
+            <div style="background: white; padding: 1rem; border-radius: 10px; border-left: 4px solid #28a745; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 0.8rem;">
+                <h3 style="color: #28a745; margin: 0 0 0.8rem 0; font-size: 1.3rem; display: flex; align-items: center;">
+                    📊 Assessment Scores
+                </h3>
+            </div>
+            """, unsafe_allow_html=True)
+
+            for key, value in scores.items():
+                if isinstance(value, (int, float)):
+                    # Color coding for scores
+                    if value >= 8:
+                        color = "#28a745"  # Green
+                        bg_color = "#d4edda"
+                        icon = "🟢"
+                    elif value >= 6:
+                        color = "#ffc107"  # Yellow
+                        bg_color = "#fff3cd"
+                        icon = "🟡"
+                    elif value >= 4:
+                        color = "#fd7e14"  # Orange
+                        bg_color = "#ffe8d4"
+                        icon = "🟠"
+                    else:
+                        color = "#dc3545"  # Red
+                        bg_color = "#f8d7da"
+                        icon = "🔴"
+
+                    st.markdown(f"""
+                    <div style="background: {bg_color}; padding: 0.7rem; margin: 0.3rem 0; border-radius: 6px; border: 1px solid {color}20;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="color: #333; font-weight: 500; font-size: 0.9rem;">{key}</span>
+                            <span style="color: {color}; font-weight: bold; font-size: 1rem;">{icon} {value}/{30 if key == 'visibility' else 40 if key == 'reputation' else 30 if key == 'experience' else 100}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style="background: #f8f9fa; padding: 0.7rem; margin: 0.3rem 0; border-radius: 6px; border: 1px solid #dee2e6;">
+                        <strong style="color: #1f4e79; font-size: 0.9rem;">{key}:</strong>
+                        <span style="color: #333; font-size: 0.9rem;">{value}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+    # Add spacing
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Display sections in tabs with enhanced styling
+    if overview or visibility or reputation or marketing or experience:
+        # Custom CSS for better tab styling
+        st.markdown("""
+        <style>
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+            background-color: #f8f9fa;
+            padding: 8px;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+        }
+        .stTabs [data-baseweb="tab"] {
+            background-color: white;
+            border-radius: 8px;
+            padding: 12px 20px;
+            font-weight: 500;
+            border: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: #1f4e79 !important;
+            color: white !important;
+            border-color: #1f4e79 !important;
+        }
+        .stTabs [data-baseweb="tab"]:hover {
+            background-color: #e8f4fd;
+            border-color: #4a90c2;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        tab_names = []
+        tab_data = []
+
+        if overview:
+            tab_names.append("🔍 Website Overview")
+            tab_data.append(("Website Overview", overview, None))
+
+        if visibility:
+            tab_names.append("👁️ Online Visibility")
+            tab_data.append(("Online Visibility", visibility, None))
+
+        if reputation:
+            tab_names.append("⭐ Reputation & Feedback")
+            tab_data.append(("Reputation & Feedback", reputation, reviews))
+
+        if marketing:
+            tab_names.append("📢 Marketing Signals")
+            tab_data.append(("Marketing Signals", marketing, None))
+
+        if experience:
+            tab_names.append("👥 Patient Experience")
+            tab_data.append(("Patient Experience", experience, None))
+
+        tabs = st.tabs(tab_names)
+
+        for i, ((section_title, section_data, section_reviews), tab) in enumerate(zip(tab_data, tabs)):
+            with tab:
+                # Display main section data
+                display_section_data(section_title, section_data)
+
+                # If this is the Reputation & Feedback tab, also display reviews
+                if section_title == "Reputation & Feedback" and section_reviews:
+                    st.markdown("---")
+                    st.markdown("""
+                    <div style="background: white; padding: 1rem; border-radius: 10px; border-left: 4px solid #8e44ad; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin: 0.8rem 0;">
+                        <h4 style="color: #8e44ad; margin: 0 0 0.8rem 0; font-size: 1.2rem;">
+                            💬 Reviews Analysis
+                        </h4>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if isinstance(section_reviews, list) and len(section_reviews) > 0:
+                        for idx, review in enumerate(section_reviews[:5]):  # Show first 5 reviews
+                            with st.expander(f"📝 Review {idx+1}", expanded=idx==0):
+                                if isinstance(review, dict):
+                                    # Define field name mappings
+                                    field_mappings = {
+                                        'relative_time': 'Date Posted',
+                                        'rating': 'Rating',
+                                        'author_name': 'Author Name',
+                                        'text': 'Feedback'
+                                    }
+
+                                    for key, value in review.items():
+                                        if value:
+                                            # Use mapped name if available, otherwise use original key
+                                            display_key = field_mappings.get(key, key)
+                                            st.markdown(f"""
+                                            <div style="background: #f8f9ff; padding: 0.6rem; margin: 0.2rem 0; border-radius: 5px; border-left: 3px solid #8e44ad;">
+                                                <strong style="color: #6c2c91; font-size: 0.9rem;">{display_key}:</strong>
+                                                <span style="color: #333; margin-left: 0.5rem; font-size: 0.9rem;">{value}</span>
+                                            </div>
+                                            """, unsafe_allow_html=True)
+                                else:
+                                    st.write(review)
+                    else:
+                        st.info("📝 No reviews data available for analysis")
+
+    # Compact footer
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="text-align: center; padding: 1.5rem 1rem; background: white; border: 2px solid #e8f4fd; border-radius: 12px; margin-top: 1rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+        <h4 style="margin: 0 0 0.5rem 0; color: #1f4e79; font-weight: 700; font-size: 1.2rem;">Powered by Needle Tail</h4>
+        <p style="color: #4a90c2; margin: 0; font-size: 0.9rem; font-weight: 500;">Experience the future of healthcare eligibility verification with AI agents that work 24/7.</p>
+        <div style="width: 50px; height: 3px; background: linear-gradient(90deg, #1f4e79 0%, #4a90c2 100%); margin: 0.8rem auto; border-radius: 2px;"></div>
+        <p style="color: #6c757d; margin: 0; font-size: 0.8rem;">© 2025 Needle Tail. All rights reserved.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+def display_section_data(title, data):
+    """Helper function to display section data in a formatted way"""
+    if not data:
+        st.markdown(f"""
+        <div style="text-align: center; padding: 2rem; background: #f8f9fa; border-radius: 12px; border: 2px dashed #dee2e6;">
+            <p style="color: #6c757d; margin: 0; font-size: 1rem;">📝 No {title.lower()} data available</p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # Color scheme for different sections
+    section_colors = {
+        "Website Overview": {"primary": "#1f4e79", "secondary": "#4a90c2", "bg": "#f8fbff"},
+        "Online Visibility": {"primary": "#e67e22", "secondary": "#f39c12", "bg": "#fef9e7"},
+        "Reputation & Feedback": {"primary": "#8e44ad", "secondary": "#9b59b6", "bg": "#f8f9ff"},
+        "Marketing Signals": {"primary": "#e74c3c", "secondary": "#c0392b", "bg": "#fdedec"},
+        "Patient Experience": {"primary": "#27ae60", "secondary": "#2ecc71", "bg": "#eafaf1"}
+    }
+
+    colors = section_colors.get(title, {"primary": "#1f4e79", "secondary": "#4a90c2", "bg": "#f8fbff"})
+
+    # Create enhanced data cards
+    for key, value in data.items():
+        if value:
+            # Handle different types of values
+            if isinstance(value, dict):
+                value_str = ", ".join([f"{k}: {v}" for k, v in value.items() if v])
+            elif isinstance(value, list):
+                value_str = ", ".join([str(v) for v in value if v])
+            else:
+                value_str = str(value)
+
+            # Truncate very long values
+            if len(value_str) > 300:
+                value_str = value_str[:300] + "..."
+
+            # Special handling for links
+            if "http" in value_str and "<a" not in value_str:
+                # Convert plain URLs to clickable links
+                import re
+                value_str = re.sub(r'(https?://[^\s]+)', r'<a href="\1" target="_blank" style="color: {primary};">\1</a>'.format(primary=colors["primary"]), value_str)
+
+            st.markdown(f"""
+            <div style="background: white; padding: 0.8rem; margin: 0.4rem 0; border-radius: 8px; border-left: 4px solid {colors['primary']}; box-shadow: 0 1px 6px rgba(0,0,0,0.05);">
+                <div style="margin-bottom: 0.3rem;">
+                    <span style="color: {colors['primary']}; font-weight: 600; font-size: 0.85rem; display: inline-block; background: {colors['bg']}; padding: 0.2rem 0.6rem; border-radius: 15px;">{key}</span>
+                </div>
+                <div style="color: #333; line-height: 1.4; padding-left: 0.3rem; font-size: 0.9rem;">
+                    {value_str}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 # ------------------------ Page & Config ------------------------
 st.set_page_config(page_title="Face Value Audit", layout="wide")
@@ -319,26 +795,66 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 
 # Check if report is ready to display (move this to top)
 if st.session_state.get('report_ready', False):
-    # Display only the report at the top of the page
-    components.html(st.session_state.report_html, height=1000, scrolling=True)
+    # Display the report using native Streamlit elements
+    final_data = st.session_state.get('final', {})
+    overview = st.session_state.get('overview', {})
+    visibility = st.session_state.get('visibility', {})
+    reputation = st.session_state.get('reputation', {})
+    marketing = st.session_state.get('marketing', {})
+    experience = st.session_state.get('experience', {})
+    scores = st.session_state.get('scores', {})
+    reviews = st.session_state.get('reviews', [])
 
-    # Reset button below the report
-    if st.button("🔄 Run Another Audit", use_container_width=True):
-        # Clear session state to start fresh
-        for key in ['draft', 'final', 'submitted', 'last_fetched_website', 'opened_report_id', 'report_ready', 'report_html']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.rerun()
+    display_native_report(final_data, overview, visibility, reputation, marketing, experience, scores, reviews)
 
-    # Add footer below the Run Another Audit button
-    st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; padding: 2rem 0; background: linear-gradient(90deg, #f8f9fa 0%, #ffffff 50%, #f8f9fa 100%); border-radius: 10px; margin-top: 3rem;">
-        <h4 style="margin: 0 0 1rem 0; color: #333; font-weight: 600;">Powered by Needle Tail</h4>
-        <p style="color: #666; margin: 0; font-size: 0.9rem;">Experience the future of healthcare eligibility verification with AI agents that work 24/7 to automate insurance verification processes.</p>
-        <p style="color: #999; margin: 0.5rem 0 0 0; font-size: 0.8rem;">© 2025 Needle Tail. All rights reserved.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # Add PDF export button
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("📄 Export to PDF", use_container_width=True):
+            if HAS_REPORTLAB:
+                with st.spinner("Generating PDF..."):
+                    website_url = st.session_state.get('last_fetched_website', 'unknown_website')
+
+                    # Get all the data from session state
+                    final_data = st.session_state.get('final', {})
+                    overview = st.session_state.get('overview', {})
+                    visibility = st.session_state.get('visibility', {})
+                    reputation = st.session_state.get('reputation', {})
+                    marketing = st.session_state.get('marketing', {})
+                    experience = st.session_state.get('experience', {})
+                    scores = st.session_state.get('scores', {})
+                    reviews = st.session_state.get('reviews', [])
+
+                    pdf_result = generate_pdf_report(
+                        final_data, overview, visibility, reputation,
+                        marketing, experience, scores, reviews, website_url
+                    )
+
+                    if pdf_result:
+                        pdf_bytes, filename = pdf_result
+                        st.download_button(
+                            label="⬇️ Download PDF Report",
+                            data=pdf_bytes,
+                            file_name=filename,
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+                        st.success("PDF generated successfully!")
+                    else:
+                        st.error("Failed to generate PDF")
+            else:
+                st.error("PDF export is not available. Please install reportlab: pip install reportlab")
+
+    with col2:
+        # Reset button
+        if st.button("🔄 Run Another Audit", use_container_width=True):
+            # Clear session state to start fresh
+            for key in ['draft', 'final', 'submitted', 'last_fetched_website', 'opened_report_id', 'report_ready', 'report_html', 'overview', 'visibility', 'reputation', 'marketing', 'experience', 'scores', 'reviews']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+
 
     # Stop rendering the rest of the page
     st.stop()
@@ -1230,174 +1746,7 @@ def website_health(url: str, soup: BeautifulSoup, load_time: float):
         checks.append("Load speed ❓")
     return f"{min(score,100)}/100", " | ".join(checks)
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def social_presence_from_site(_soup: BeautifulSoup):
-    """Extract social media presence with comprehensive search including text-based detection"""
-    if not _soup:
-        return {"platforms": [], "links": {}, "summary": "None"}
 
-    platforms_found = {}
-
-    # STEP 1: Search for any text mentioning social media accounts (as requested)
-    page_text = _soup.get_text(" ", strip=True)
-
-    # Search for Facebook references in text
-    fb_patterns = [
-        r"facebook\.com/[\w./-]+",
-        r"@[\w.]+\s*on\s*facebook",
-        r"facebook[:\s]*[@]?[\w.]+",
-        r"fb\.com/[\w./-]+",
-        r"find us on facebook[:\s]*[@]?[\w.]*"
-    ]
-
-    for pattern in fb_patterns:
-        matches = re.findall(pattern, page_text, re.IGNORECASE)
-        if matches:
-            # Take the first match and try to construct a proper URL
-            match = matches[0].strip()
-            if match.startswith(('facebook.com/', 'fb.com/')):
-                if not match.startswith('http'):
-                    platforms_found["Facebook"] = f"https://www.{match}"
-                else:
-                    platforms_found["Facebook"] = match
-            break
-
-    # Search for Instagram references in text
-    ig_patterns = [
-        r"instagram\.com/[\w./-]+",
-        r"@[\w.]+\s*on\s*instagram",
-        r"instagram[:\s]*[@]?[\w.]+",
-        r"insta[:\s]*[@]?[\w.]+"
-    ]
-
-    for pattern in ig_patterns:
-        matches = re.findall(pattern, page_text, re.IGNORECASE)
-        if matches:
-            match = matches[0].strip()
-            if 'instagram.com/' in match:
-                if not match.startswith('http'):
-                    platforms_found["Instagram"] = f"https://www.{match}"
-                else:
-                    platforms_found["Instagram"] = match
-            break
-
-    # Search for Twitter/X references in text
-    twitter_patterns = [
-        r"twitter\.com/[\w./-]+",
-        r"x\.com/[\w./-]+",
-        r"@[\w.]+\s*on\s*twitter",
-        r"twitter[:\s]*[@]?[\w.]+",
-        r"tweet\s*[@]?[\w.]+"
-    ]
-
-    for pattern in twitter_patterns:
-        matches = re.findall(pattern, page_text, re.IGNORECASE)
-        if matches:
-            match = matches[0].strip()
-            if any(domain in match for domain in ['twitter.com/', 'x.com/']):
-                if not match.startswith('http'):
-                    platforms_found["Twitter"] = f"https://www.{match}"
-                else:
-                    platforms_found["Twitter"] = match
-            break
-
-    # Search for Yelp references in text
-    yelp_patterns = [
-        r"yelp\.com/biz/[\w./-]+",
-        r"yelp[:\s]*[\w.\s-]+",
-        r"find us on yelp"
-    ]
-
-    for pattern in yelp_patterns:
-        matches = re.findall(pattern, page_text, re.IGNORECASE)
-        if matches:
-            match = matches[0].strip()
-            if 'yelp.com/biz/' in match:
-                if not match.startswith('http'):
-                    platforms_found["Yelp"] = f"https://www.{match}"
-                else:
-                    platforms_found["Yelp"] = match
-            break
-
-    # STEP 2: If text search didn't find everything, search HTML links more broadly
-    all_links = [a.get("href", "") for a in _soup.find_all("a", href=True)]
-
-    # Define patterns that suggest it's NOT the practice's profile (more selective now)
-    exclude_patterns = [
-        "/sharer", "/share.php", "/plugins", "/tr/", "/intent/", "/embed/",
-        "oauth", "login", "api.facebook", "developers.", "business.facebook.com/help"
-    ]
-
-    for href in all_links:
-        href_lower = href.lower()
-
-        # Skip obvious sharing/widget links
-        if any(pattern in href_lower for pattern in exclude_patterns):
-            continue
-
-        # Facebook detection - be more permissive
-        if "facebook.com/" in href_lower and "Facebook" not in platforms_found:
-            # More inclusive - accept most facebook.com links that aren't sharing widgets
-            if href_lower.count("/") >= 3:  # Has some path after facebook.com
-                platforms_found["Facebook"] = href
-
-        # Instagram detection - more permissive
-        elif "instagram.com/" in href_lower and "Instagram" not in platforms_found:
-            if href_lower.count("/") >= 3:  # Has some path after instagram.com
-                platforms_found["Instagram"] = href
-
-        # Twitter/X detection - more permissive
-        elif ("twitter.com/" in href_lower or "x.com/" in href_lower) and "Twitter" not in platforms_found:
-            if href_lower.count("/") >= 3:  # Has some path after twitter.com/x.com
-                platforms_found["Twitter"] = href
-
-        # Yelp detection
-        elif "yelp.com/biz/" in href_lower and "Yelp" not in platforms_found:
-            platforms_found["Yelp"] = href
-
-    # STEP 3: Look for social media icons or widgets (even if no direct links)
-    # Search for common social media class names and data attributes
-    social_elements = []
-
-    # Look for Font Awesome icons, common CSS classes, and data attributes
-    for element in _soup.find_all(['i', 'span', 'div', 'a'], class_=True):
-        classes = ' '.join(element.get('class', [])).lower()
-        if any(social in classes for social in ['fa-facebook', 'facebook', 'fb-', 'icon-facebook']):
-            if "Facebook" not in platforms_found:
-                # Try to find a parent link or data attribute
-                parent_link = element.find_parent('a')
-                if parent_link and parent_link.get('href'):
-                    href = parent_link.get('href')
-                    if 'facebook.com' in href.lower():
-                        platforms_found["Facebook"] = href
-
-        elif any(social in classes for social in ['fa-instagram', 'instagram', 'ig-', 'icon-instagram']):
-            if "Instagram" not in platforms_found:
-                parent_link = element.find_parent('a')
-                if parent_link and parent_link.get('href'):
-                    href = parent_link.get('href')
-                    if 'instagram.com' in href.lower():
-                        platforms_found["Instagram"] = href
-
-    # Format results
-    platform_list = list(platforms_found.keys())
-
-    if len(platform_list) == 4:
-        summary = "Facebook, Instagram, Twitter, Yelp"
-    elif len(platform_list) >= 3:
-        summary = ", ".join(platform_list)
-    elif len(platform_list) == 2:
-        summary = ", ".join(platform_list)
-    elif len(platform_list) == 1:
-        summary = platform_list[0]
-    else:
-        summary = "None"
-
-    return {
-        "platforms": platform_list,
-        "links": platforms_found,
-        "summary": summary
-    }
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def comprehensive_llm_analysis(_soup: BeautifulSoup, website_url: str, practice_name: str, reviews: list):
@@ -1418,18 +1767,6 @@ def comprehensive_llm_analysis(_soup: BeautifulSoup, website_url: str, practice_
         page_text = _soup.get_text(" ", strip=True)[:2500]  # Reduced limit
         links = [a.get("href") or "" for a in _soup.find_all("a", href=True)]
 
-        # Filter social media links - be more comprehensive
-        social_platforms = ["facebook", "instagram", "twitter", "x.com", "yelp", "fb.com", "ig.com"]
-        social_links = [l for l in links[:50] if any(platform in l.lower() for platform in social_platforms)]
-
-        # Also search for social media mentions in text
-        social_text_mentions = []
-        for platform in ["Facebook", "Instagram", "Twitter", "Yelp"]:
-            if platform.lower() in page_text.lower():
-                social_text_mentions.append(f"'{platform}' mentioned in text")
-
-        if social_text_mentions:
-            social_links.extend(social_text_mentions)
 
         # Basic counts
         img_count = len(_soup.find_all("img"))
@@ -1451,19 +1788,11 @@ def comprehensive_llm_analysis(_soup: BeautifulSoup, website_url: str, practice_
         Practice: {practice_name or "Dental Practice"}
         Website: {website_url}
         Content: {page_text[:800]}...
-
-        Social Media Links Found: {social_links[:5]}
         Visual Content: {img_count} images, {vid_count} videos
         Sample Reviews: {reviews_context[:500]}
 
         Return JSON with ALL sections:
         {{
-            "social_media": {{
-                "platforms": ["Facebook", "Instagram", "Twitter", "Yelp"],
-                "links": {{"Facebook": "url_or_null", "Instagram": "url_or_null", "Twitter": "url_or_null", "Yelp": "url_or_null"}},
-                "advice": "Brief social media strategy advice",
-                "visibility_insights": "• Implement local SEO with city + dentist keywords\\n• Create Google My Business posts weekly\\n• Build local directory citations"
-            }},
             "reputation": {{
                 "sentiment": "Overall review sentiment summary",
                 "positive_themes": "Top positive themes (comma-separated)",
@@ -1474,18 +1803,17 @@ def comprehensive_llm_analysis(_soup: BeautifulSoup, website_url: str, practice_
                 "content_quality": "Website content assessment",
                 "visual_effectiveness": "Photo/video marketing assessment",
                 "key_recommendations": "Top 3 marketing improvements",
-                "advertising_advice": "Marketing tools recommendation"
+                "advertising_advice": "Marketing tools recommendation",
+                "visibility_insights": "• Implement local SEO with city + dentist keywords\\n• Create Google My Business posts weekly\\n• Build local directory citations"
             }}
         }}
 
         CRITICAL REQUIREMENTS:
         1. For visibility_insights: Provide exactly 3 actionable bullet points formatted as "• Point 1\\n• Point 2\\n• Point 3"
         2. Each bullet point should be specific, actionable advice a dental practice can implement immediately
-        3. Focus on: local SEO, Google My Business, online directories, website optimization, social media presence
+        3. Focus on: local SEO, Google My Business, online directories, website optimization
         4. Act as an expert marketing consultant - give professional, practical advice
         5. Keep bullet points under 60 characters each for clear display
-
-        For social media links, only include actual practice profile URLs, not general pages or sharing widgets.
         """
 
         response_text = call_claude_api(prompt)
@@ -1575,8 +1903,6 @@ def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews)
 
         # Fast data preparation
         page_text = soup.get_text(" ", strip=True)[:1500]  # Reduced from 2500
-        links = [a.get("href") or "" for a in soup.find_all("a", href=True)]
-        social_links = [l for l in links[:15] if any(platform in l.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])][:3]  # Limit to 3
 
         # Simplified prompt for faster processing
         prompt = f"""
@@ -1585,16 +1911,9 @@ def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews)
         Practice: {practice_name or "Dental Practice"}
         Website: {website_url}
         Content: {page_text[:600]}...
-        Social Links: {social_links}
 
         Return JSON:
         {{
-            "social_media": {{
-                "platforms": ["Facebook", "Instagram", "Twitter", "Yelp"],
-                "links": {{"Facebook": "url_or_null", "Instagram": "url_or_null", "Twitter": "url_or_null", "Yelp": "url_or_null"}},
-                "advice": "Brief social media strategy advice",
-                "visibility_insights": "• Optimize Google My Business\\n• Add location-based keywords\\n• Build online directory listings"
-            }},
             "reputation": {{
                 "sentiment": "Review sentiment summary",
                 "positive_themes": "Top positive themes",
@@ -1604,7 +1923,8 @@ def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews)
             "marketing": {{
                 "content_quality": "Website content assessment",
                 "key_recommendations": "Top 3 marketing improvements",
-                "advertising_advice": "Marketing tools recommendation"
+                "advertising_advice": "Marketing tools recommendation",
+                "visibility_insights": "• Optimize Google My Business\\n• Add location-based keywords\\n• Build online directory listings"
             }}
         }}
 
@@ -1633,63 +1953,6 @@ def stream_llm_analysis_with_progress(soup, website_url, practice_name, reviews)
         # Return None on any error - the app will continue with basic analysis
         return None
 
-def extract_social_media_with_llm(links, soup):
-    """Use Claude AI to identify social media profile links"""
-    if not (HAS_CLAUDE and CLAUDE_API_KEY):
-        return None
-
-    try:
-        # Prepare context for LLM
-        page_text = soup.get_text(" ", strip=True)[:2000]  # Limit context
-        links_text = "\n".join([f"- {link}" for link in links[:50] if any(platform in link.lower() for platform in ["facebook", "instagram", "twitter", "x.com", "yelp"])])
-
-        if not links_text:
-            return None
-
-        prompt = f"""
-        Analyze this dental practice website content and identify OFFICIAL social media profile links.
-
-        Website context: {page_text[:500]}...
-
-        Potential social media links found:
-        {links_text}
-
-        For each link, determine if it's an OFFICIAL profile for this dental practice (not ads, general pages, or unrelated profiles).
-
-        Return ONLY a JSON object with this exact format:
-        {{
-            "links": {{
-                "Facebook": "actual_facebook_url_or_null",
-                "Instagram": "actual_instagram_url_or_null",
-                "Twitter": "actual_twitter_url_or_null",
-                "Yelp": "actual_yelp_url_or_null"
-            }}
-        }}
-
-        Rules:
-        - Only include URLs that are clearly official practice profiles
-        - Use null for platforms with no official presence
-        - Yelp business pages count as official presence
-        - Personal profiles or general company pages don't count
-        """
-
-        response_text = call_claude_api(prompt)
-        if not response_text:
-            return None
-
-        # Parse LLM response
-        response_text = response_text.strip()
-        if "```json" in response_text:
-            json_text = response_text.split("```json")[1].split("```")[0].strip()
-        else:
-            json_text = response_text
-
-        result = json.loads(json_text)
-        return result
-
-    except Exception as e:
-        st.sidebar.write(f"LLM extraction error: {str(e)[:100]}")
-        return None
 
 def analyze_marketing_signals_with_llm(_soup: BeautifulSoup, website_url: str, practice_name: str = ""):
     """Enhanced marketing analysis using Claude AI"""
@@ -1914,7 +2177,7 @@ def analyze_local_seo_signals(soup: BeautifulSoup, address: str = ""):
 
     return '; '.join(local_signals) if local_signals else "Limited local SEO"
 
-def generate_marketing_insights(soup: BeautifulSoup, website_url: str, practice_name: str, social_data: dict, photos_count: int, advertising_tools: str):
+def generate_marketing_insights(soup: BeautifulSoup, website_url: str, practice_name: str, photos_count: int, advertising_tools: str):
     """Generate AI-powered marketing insights and recommendations"""
     if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
         return "Enable Claude AI for detailed insights"
@@ -1926,19 +2189,11 @@ def generate_marketing_insights(soup: BeautifulSoup, website_url: str, practice_
         content_strategy = analyze_content_marketing(soup, website_url)
         local_seo = analyze_local_seo_signals(soup)
 
-        # Social media status
-        social_platforms = []
-        if social_data:
-            for platform, status in social_data.items():
-                if status and status != "❌":
-                    social_platforms.append(platform)
-
         prompt = f"""
         Analyze this dental practice's marketing and provide EXACTLY 3 short, actionable recommendations:
 
         Practice: {practice_name}
         Current Status:
-        - Social Media: {', '.join(social_platforms) if social_platforms else 'Limited presence'}
         - Photos: {photos_count} on Google
         - Tools: {advertising_tools}
         - Website Features: {conversion_elements}
@@ -1972,6 +2227,43 @@ def generate_marketing_insights(soup: BeautifulSoup, website_url: str, practice_
     except Exception as e:
         st.sidebar.write(f"⚠️ Marketing insights error: {str(e)[:50]}")
         return "• Optimize Google My Business profile\n• Add more professional photos\n• Implement online booking system"
+
+def format_insights_to_bullets(insights_text):
+    """Format marketing insights to exactly 3 concise bullet points"""
+    if not insights_text:
+        return "• Optimize Google My Business profile\n• Add more professional photos\n• Implement online booking system"
+
+    # Handle both string and list inputs
+    if isinstance(insights_text, list):
+        insights_text = ' '.join(str(item) for item in insights_text)
+    elif not isinstance(insights_text, str):
+        insights_text = str(insights_text)
+
+    # Remove square brackets if present
+    cleaned_text = insights_text.replace('[', '').replace(']', '').strip()
+
+    # Split into sentences and extract key points
+    sentences = [s.strip() for s in cleaned_text.replace('.', '.\n').split('\n') if s.strip()]
+
+    # Convert to bullet points
+    bullet_points = []
+    for sentence in sentences[:3]:  # Take first 3 sentences
+        # Clean up and truncate if too long
+        clean_sentence = sentence.replace('•', '').replace('-', '').strip()
+        if len(clean_sentence) > 60:  # Truncate if too long
+            clean_sentence = clean_sentence[:57] + "..."
+        bullet_points.append(f"• {clean_sentence}")
+
+    # Ensure we have exactly 3 bullet points
+    while len(bullet_points) < 3:
+        defaults = [
+            "• Optimize Google My Business profile",
+            "• Add more professional photos",
+            "• Implement online booking system"
+        ]
+        bullet_points.append(defaults[len(bullet_points)])
+
+    return '\n'.join(bullet_points[:3])
 
 def appointment_booking_from_site(soup: BeautifulSoup):
     if not soup: return "Search limited"
@@ -2254,29 +2546,11 @@ def to_pct_from_score_str(s):
         pass
     return None
 
-def compute_smile_score(wh_pct, social_present, rating, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False):
+def compute_smile_score(wh_pct, rating, reviews_total, booking, hours_present, insurance_clear, accessibility_present=False):
+    # Visibility based only on website health score
     vis_parts = []
-    if isinstance(wh_pct, (int,float)): vis_parts.append(wh_pct)
-
-    # New 4-platform scoring system
-    if isinstance(social_present, dict):
-        platforms = social_present.get("platforms", [])
-        platform_score = len(platforms) * 25  # 25 points per platform
-        vis_parts.append(min(platform_score, 100))
-    elif isinstance(social_present, str):
-        # Fallback for old format
-        if social_present == "Facebook, Instagram, Twitter, Yelp":
-            vis_parts.append(100)
-        elif "," in social_present and len(social_present.split(",")) >= 3:
-            vis_parts.append(75)
-        elif "," in social_present:
-            vis_parts.append(50)
-        elif social_present not in ("None", ""):
-            vis_parts.append(25)
-        else:
-            vis_parts.append(0)
-    else:
-        vis_parts.append(0)
+    if isinstance(wh_pct, (int,float)):
+        vis_parts.append(wh_pct)
 
     vis_avg = sum(vis_parts)/len(vis_parts) if vis_parts else 0
     vis_score = (vis_avg/100)*30
@@ -2317,9 +2591,9 @@ def advise(metric, value):
         pct = pct_from_score_str(value)
         return "You nailed it" if (pct is not None and pct >= 90) else "Improve HTTPS/mobile/speed"
 
-    if "gbp completeness" in metric.lower():
+    if "google business profile completeness" in metric.lower():
         pct = pct_from_score_str(value)
-        return "You nailed it" if (pct is not None and pct >= 90) else "Add hours, photos, website, phone on GBP"
+        return "You nailed it" if (pct is not None and pct >= 90) else "Add hours, photos, website, phone on Google Business Profile"
 
     if "search visibility" in metric.lower():
         return "You nailed it" if "yes" in s else "Improve local SEO & citations"
@@ -2327,96 +2601,8 @@ def advise(metric, value):
     if "ai insights" in metric.lower():
         return "AI-generated recommendations based on website analysis"
 
-    if "social media presence" in metric.lower():
-        # Try LLM-based advice first
-        llm_advice = generate_social_media_advice_with_llm(value)
-        if llm_advice:
-            return llm_advice
 
-        # Fallback to rule-based advice
-        if isinstance(value, dict):
-            platforms = value.get("platforms", [])
-            if len(platforms) >= 4: return "You nailed it - excellent social presence!"
-            elif len(platforms) == 3: return "Great start! Add remaining platform for complete coverage"
-            elif len(platforms) == 2: return "Good foundation. Add 2 more platforms and post regularly"
-            elif len(platforms) == 1: return "Expand to Facebook, Instagram, Twitter & Yelp"
-            else: return "Create profiles on Facebook, Instagram, Twitter & Yelp"
-        else:
-            # Old string format fallback
-            if "facebook, instagram, twitter, yelp" in s.lower(): return "You nailed it"
-            if len([p for p in ["facebook", "instagram", "twitter", "yelp"] if p in s.lower()]) >= 3: return "Almost there! Add missing platform"
-            if "facebook" in s or "instagram" in s: return "Add other platforms & post weekly"
-            return "Add FB/IG/Twitter/Yelp links; post 2–3×/week"
 
-def format_social_media_with_links(social_data):
-    """Format social media presence with hyperlinks for display in reports"""
-    if not isinstance(social_data, dict):
-        return str(social_data)
-
-    platforms = social_data.get("platforms", [])
-    links = social_data.get("links", {})
-
-    if not platforms:
-        return "None"
-
-    # Create linked platform names
-    linked_platforms = []
-    for platform in platforms:
-        link = links.get(platform)
-        if link and link != "null":  # LLM might return "null" string
-            # Clean the link - ensure it's a proper URL
-            clean_link = link.strip()
-            if not clean_link.startswith(('http://', 'https://')):
-                clean_link = 'https://' + clean_link
-            linked_platforms.append(f'<a href="{escape(clean_link)}" target="_blank" rel="noopener">{escape(platform)}</a>')
-        else:
-            linked_platforms.append(escape(platform))
-
-    return ", ".join(linked_platforms)
-
-def generate_social_media_advice_with_llm(social_data):
-    """Generate personalized social media advice using Claude"""
-    if not (HAS_CLAUDE and CLAUDE_API_KEY):
-        return None
-
-    try:
-        if isinstance(social_data, dict):
-            platforms = social_data.get("platforms", [])
-            links = social_data.get("links", {})
-        else:
-            # Fallback for string format
-            platforms = [p.strip() for p in str(social_data).split(",") if p.strip() != "None"]
-            links = {}
-
-        platform_count = len(platforms)
-        missing_platforms = [p for p in ["Facebook", "Instagram", "Twitter", "Yelp"] if p not in platforms]
-
-        prompt = f"""
-        Generate concise social media advice for a dental practice with current presence on: {platforms if platforms else "no platforms"}.
-
-        Missing platforms: {missing_platforms}
-
-        Provide a brief, actionable recommendation (max 15 words) focusing on:
-        - Which platforms to prioritize next
-        - Content strategy hints
-        - Patient engagement tips
-
-        Make it dental practice specific and professional.
-        """
-
-        response_text = call_claude_api(prompt)
-        if not response_text:
-            return None
-
-        advice = response_text.strip()
-        # Clean up the response
-        if len(advice) > 100:  # Truncate if too long
-            advice = advice[:97] + "..."
-
-        return advice
-
-    except Exception as e:
-        return None  # Fallback to rule-based advice
 
 def generate_reputation_advice_with_llm(advice_type, value):
     """Generate LLM-powered reputation management advice"""
@@ -2491,7 +2677,7 @@ def generate_reputation_advice_with_llm(advice_type, value):
         return "Offer evenings/weekends to boost conversions"
 
     if "insurance acceptance" in metric.lower():
-        return "You nailed it" if ("unclear" not in s) else "Publish accepted plans on site & GBP"
+        return "You nailed it" if ("unclear" not in s) else "Publish accepted plans on site & Google Business Profile"
 
     if "sentiment highlights" in metric.lower():
         # Try LLM-based reputation advice
@@ -2656,14 +2842,13 @@ def append_submission_to_sheet(data: dict) -> bool:
         st.warning(f"Couldn’t save to Google Sheet: {e}", icon="⚠️")
         return False
 
+
+
 def build_static_report_html(final, overview, visibility, reputation, marketing, experience, scores, reviews):
     def _kv_table(title, d):
         rows = ""
         for k, v in d.items():
-            # Special handling for Social Media Presence to preserve HTML links
-            if k == "Social Media Presence" and isinstance(v, str) and "<a href=" in v:
-                cell_content = v  # Don't escape HTML links
-            elif isinstance(v, str):
+            if isinstance(v, str):
                 cell_content = escape(v)
             elif v:
                 cell_content = escape(json.dumps(v))
@@ -3274,8 +3459,6 @@ with st.form("practice_details_form", clear_on_submit=False):
 
         # 👉 append to Google Sheet BEFORE audit begins
         saved = append_submission_to_sheet(st.session_state.final)
-        if saved:
-            st.toast("Saved to Google Sheet ✅")
 
         # now proceed with your existing flow
         st.session_state.submitted = True
@@ -3334,13 +3517,12 @@ def show_visibility_cards(visibility: dict):
         unsafe_allow_html=True
     )
 
-    # Exactly six metrics -> 3x2
+    # Five metrics now
     order = [
-        "GBP Completeness (estimate)",
+        "Google Business Profile Completeness (estimate)",
         "Website Health Score",
         "Search Visibility (Page 1?)",
-        "Social Media Presence",
-        "GBP Signals",
+        "Google Business Profile Signals",
         "Website Health Checks",
     ]
     items = [(k, visibility.get(k, "—")) for k in order if k in visibility]
@@ -4088,27 +4270,7 @@ if st.session_state.submitted:
 
         # 2) Visibility
         wh_str, wh_checks = website_health(website, soup, load_time)
-        social_data = social_presence_from_site(soup)
-
-        # Enhance social data with LLM insights
-        if comprehensive_analysis and comprehensive_analysis.get("social_media"):
-            social_llm = comprehensive_analysis["social_media"]
-            if social_llm.get("links"):
-                # Merge LLM-detected links with existing data
-                if isinstance(social_data, dict):
-                    social_data["links"] = {**social_data.get("links", {}), **social_llm["links"]}
-                    social_data["platforms"] = list(set((social_data.get("platforms", []) + social_llm.get("platforms", []))))
-
         appears = appears_on_page1_for_dentist_near_me(website, clinic_name, address)
-
-        # Format social media display with hyperlinks
-        if isinstance(social_data, dict):
-            if social_data.get("links") or social_data.get("platforms"):
-                social_display = format_social_media_with_links(social_data)
-            else:
-                social_display = social_data.get("summary", "None")
-        else:
-            social_display = str(social_data)
 
         gbp_score = "Search limited"; gbp_signals = "Search limited"
         if details and details.get("status") == "OK":
@@ -4135,8 +4297,8 @@ if st.session_state.submitted:
 
         # Get AI insights for online visibility
         visibility_ai_insights = ""
-        if comprehensive_analysis and comprehensive_analysis.get("social_media", {}).get("visibility_insights"):
-            insights = comprehensive_analysis["social_media"]["visibility_insights"]
+        if comprehensive_analysis and comprehensive_analysis.get("marketing", {}).get("visibility_insights"):
+            insights = comprehensive_analysis["marketing"]["visibility_insights"]
             # Format as bullet points for dataframe display
             if isinstance(insights, str):
                     # Clean up the insights string and ensure proper bullet point formatting
@@ -4174,16 +4336,15 @@ if st.session_state.submitted:
 
                     # Fallback to default insights if nothing was extracted
                     if not visibility_ai_insights.strip():
-                        visibility_ai_insights = "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
+                        visibility_ai_insights = "• Optimize Google My Business profile\n• Build local SEO citations\n• Improve website mobile experience"
 
         visibility = {
-            "GBP Completeness (estimate)": gbp_score,
-            "GBP Signals": gbp_signals,
+            "Google Business Profile Completeness (estimate)": gbp_score,
+            "Google Business Profile Signals": gbp_signals,
             "Search Visibility (Page 1?)": appears,
             "Website Health Score": wh_str,
             "Website Health Checks": wh_checks,
-            "Social Media Presence": social_display,
-            "AI Insights": visibility_ai_insights if visibility_ai_insights else "• Optimize Google My Business profile\n• Build local SEO citations\n• Create regular social media content"
+            "AI Insights": visibility_ai_insights if visibility_ai_insights else "• Optimize Google My Business profile\n• Build local SEO citations\n• Improve website mobile experience"
         }
 
         # 3) Reputation
@@ -4244,7 +4405,6 @@ if st.session_state.submitted:
             soup,
             website,
             final.get('practice_name', ''),
-            social_data,
             photos_in_google if isinstance(photos_in_google, int) else 0,
             advertising_tools
         ) if soup else "Enable Claude AI for detailed marketing insights"
@@ -4259,9 +4419,11 @@ if st.session_state.submitted:
             "AI Marketing Strategy Insights": ai_insights
         }
 
-        # Add legacy LLM insights if available (fallback)
+        # Add legacy LLM insights if available (fallback) - formatted as concise bullet points
         if marketing_insights and not ai_insights.startswith("Enable Claude"):
-            marketing["Additional Insights"] = marketing_insights
+            # Process marketing_insights to ensure it's short and crisp (max 3 bullet points)
+            formatted_insights = format_insights_to_bullets(marketing_insights)
+            marketing["Additional Insights"] = formatted_insights
 
         # 5) Experience - Enhanced with LLM analysis
         appointment_channels = appointment_channels_from_site(soup, website)
@@ -4292,7 +4454,7 @@ if st.session_state.submitted:
         insurance_clear = isinstance(insurance_info, str) and insurance_info not in ["Search limited", "Unclear"]
 
         smile, vis_score, rep_score, exp_score = compute_smile_score(
-            wh_pct, social_data, rating_val, reviews_total, appointment_channels, hours_present, insurance_clear, accessibility_present=False
+            wh_pct, rating_val, reviews_total, appointment_channels, hours_present, insurance_clear, accessibility_present=False
         )
 
         # Build scores dictionary for report
@@ -4308,9 +4470,17 @@ if st.session_state.submitted:
             final, overview, visibility, reputation, marketing, experience, scores, reviews
         )
 
-        # Set a flag to indicate report is ready
+        # Set a flag to indicate report is ready and store all data components
         st.session_state.report_ready = True
         st.session_state.report_html = report_html
+        st.session_state.final = final
+        st.session_state.overview = overview
+        st.session_state.visibility = visibility
+        st.session_state.reputation = reputation
+        st.session_state.marketing = marketing
+        st.session_state.experience = experience
+        st.session_state.scores = scores
+        st.session_state.reviews = reviews
 
         # Trigger a rerun to display the report at the top
         st.rerun()
