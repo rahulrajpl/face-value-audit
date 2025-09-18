@@ -113,7 +113,15 @@ def call_claude_api(prompt: str, model: str = "claude-3-haiku-20240307", timeout
         st.warning("⚠️ Claude API took too long. Skipping AI analysis...")
         return None
     except Exception as e:
-        st.sidebar.write(f"⚠️ Claude API error: {str(e)[:100]}")
+        error_msg = str(e)
+        if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
+            st.sidebar.error(f"🔑 Claude API Authentication Error: {error_msg[:150]}")
+        elif "rate_limit" in error_msg.lower() or "quota" in error_msg.lower():
+            st.sidebar.error(f"⏳ Claude API Rate Limited: {error_msg[:150]}")
+        elif "network" in error_msg.lower() or "connection" in error_msg.lower():
+            st.sidebar.error(f"🌐 Claude API Network Error: {error_msg[:150]}")
+        else:
+            st.sidebar.error(f"⚠️ Claude API Error: {error_msg[:150]}")
         return None
     finally:
         # Ensure alarm is cancelled
@@ -896,9 +904,22 @@ CLAUDE_API_KEY = st.secrets.get("CLAUDE_API_KEY", os.getenv("CLAUDE_API_KEY"))
 
 # Configure Claude if available
 if HAS_CLAUDE and CLAUDE_API_KEY:
-    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    try:
+        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        # Test the connection
+        st.sidebar.success(f"✅ Claude AI initialized successfully")
+    except Exception as e:
+        claude_client = None
+        st.sidebar.error(f"❌ Claude AI initialization failed: {str(e)}")
 else:
     claude_client = None
+    if not HAS_CLAUDE:
+        st.sidebar.warning("⚠️ Claude library not available. Install: pip install anthropic")
+    elif not CLAUDE_API_KEY:
+        st.sidebar.warning("⚠️ Claude API key not found in secrets or environment")
+        # Debug secrets access
+        st.sidebar.write("🔧 Available secrets keys:", list(st.secrets.keys()) if hasattr(st, 'secrets') else "No secrets object")
+        st.sidebar.write("🔧 Environment CLAUDE_API_KEY:", "Found" if os.getenv("CLAUDE_API_KEY") else "Not found")
 COLUMNS = ["Website Link", "Doctor Name", "Email ID", "Phone Number", "Practice Name", "Address", "Timestamp (IST)"] #For google sheet updation
 
 # Debug: Check API keys configuration (REMOVE AFTER DEBUGGING)
@@ -1144,12 +1165,16 @@ def extract_doctor_name_with_llm(soup: BeautifulSoup, website_url: str):
 
 def extract_email_with_llm(soup: BeautifulSoup, website_url: str):
     """Extract contact email using LLM"""
+    st.sidebar.write(f"🔧 Email extraction - HAS_CLAUDE: {HAS_CLAUDE}, API_KEY: {'Yes' if CLAUDE_API_KEY else 'No'}, soup: {'Yes' if soup else 'No'}")
+
     if not (HAS_CLAUDE and CLAUDE_API_KEY and soup):
+        st.sidebar.write("❌ Email extraction prerequisites not met")
         return None
 
     try:
         # Get page content
         page_text = soup.get_text(" ", strip=True)[:1500]
+        st.sidebar.write(f"🔧 Page content length: {len(page_text)}")
 
         # Create focused prompt for email extraction
         prompt = f"""
@@ -1167,8 +1192,12 @@ def extract_email_with_llm(soup: BeautifulSoup, website_url: str):
 
         Email Address:"""
 
+        st.sidebar.write("🔧 Calling Claude API for email extraction...")
         result = call_claude_api(prompt)
+        st.sidebar.write(f"🔧 Claude API result: {result[:50] if result else 'None'}...")
+
         if not result:
+            st.sidebar.write("❌ No result from Claude API")
             return None
 
         result = result.strip()
@@ -1176,8 +1205,10 @@ def extract_email_with_llm(soup: BeautifulSoup, website_url: str):
         # Validate the result with email regex
         if (result and result != "NOT_FOUND" and
             _valid_email(result)):
+            st.sidebar.write(f"✅ Valid email found: {result}")
             return result
 
+        st.sidebar.write(f"❌ Invalid email result: {result}")
         return None
 
     except Exception as e:
@@ -1455,13 +1486,36 @@ def prefill_from_website(website_url: str):
     # LLM-ONLY extraction approach
     st.sidebar.write("🤖 Using AI to extract contact details...")
 
+    # Debug: Show Claude status
+    api_key_preview = f"{CLAUDE_API_KEY[:15]}..." if CLAUDE_API_KEY else "None"
+    st.sidebar.write(f"🔧 Debug: HAS_CLAUDE={HAS_CLAUDE}, API_KEY_SET={'Yes' if CLAUDE_API_KEY else 'No'} ({api_key_preview}), CLIENT_READY={'Yes' if claude_client else 'No'}")
+
+    # Test a simple Claude API call
+    if claude_client:
+        st.sidebar.write("🧪 Testing Claude API connection...")
+        test_result = call_claude_api("Say 'test'", timeout=10)
+        if test_result:
+            st.sidebar.success(f"✅ Claude API test successful: {test_result[:20]}...")
+        else:
+            st.sidebar.error("❌ Claude API test failed")
+
     # Step 1: Guess practice name from URL and validate with LLM
+    st.sidebar.write("🏥 Extracting practice name...")
     practice_name = guess_practice_name_from_url_with_llm(website_url, soup)
+    st.sidebar.write(f"🏥 Practice name result: {practice_name or 'None'}")
 
     # Step 2: Extract all other fields using ONLY LLM
+    st.sidebar.write("🏠 Extracting address...")
     addr = extract_address_with_llm(soup, website_url)
+    st.sidebar.write(f"🏠 Address result: {addr or 'None'}")
+
+    st.sidebar.write("📧 Extracting email...")
     email = extract_email_with_llm(soup, website_url)
+    st.sidebar.write(f"📧 Email result: {email or 'None'}")
+
+    st.sidebar.write("📞 Extracting phone...")
     phone = extract_phone_with_llm(soup, website_url)
+    st.sidebar.write(f"📞 Phone result: {phone or 'None'}")
 
     # Step 4: Set messages for missing information and success indicators
     if not email:
