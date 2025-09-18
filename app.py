@@ -900,7 +900,44 @@ if "last_fetched_website" not in st.session_state:
 PLACES_API_KEY = st.secrets.get("GOOGLE_PLACES_API_KEY", os.getenv("GOOGLE_PLACES_API_KEY"))
 CSE_API_KEY    = st.secrets.get("GOOGLE_CSE_API_KEY", os.getenv("GOOGLE_CSE_API_KEY"))
 CSE_CX         = st.secrets.get("GOOGLE_CSE_CX", os.getenv("GOOGLE_CSE_CX"))
-CLAUDE_API_KEY = st.secrets.get("CLAUDE_API_KEY", os.getenv("CLAUDE_API_KEY"))
+# Enhanced secrets loading for Streamlit Cloud compatibility
+try:
+    # Try different methods to access Claude API key
+    CLAUDE_API_KEY = None
+
+    # Method 1: Direct secrets access
+    if hasattr(st, 'secrets') and 'CLAUDE_API_KEY' in st.secrets:
+        CLAUDE_API_KEY = st.secrets["CLAUDE_API_KEY"]
+        st.sidebar.write("🔧 API Key loaded from st.secrets direct access")
+
+    # Method 2: st.secrets.get()
+    elif hasattr(st, 'secrets'):
+        CLAUDE_API_KEY = st.secrets.get("CLAUDE_API_KEY")
+        if CLAUDE_API_KEY:
+            st.sidebar.write("🔧 API Key loaded from st.secrets.get()")
+
+    # Method 3: Environment variables
+    if not CLAUDE_API_KEY:
+        CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+        if CLAUDE_API_KEY:
+            st.sidebar.write("🔧 API Key loaded from environment")
+
+    # Method 4: Try alternative secret names
+    if not CLAUDE_API_KEY and hasattr(st, 'secrets'):
+        for alt_name in ['claude_api_key', 'ANTHROPIC_API_KEY', 'anthropic_api_key']:
+            if alt_name in st.secrets:
+                CLAUDE_API_KEY = st.secrets[alt_name]
+                st.sidebar.write(f"🔧 API Key loaded from alternative name: {alt_name}")
+                break
+
+    if CLAUDE_API_KEY:
+        st.sidebar.write(f"✅ Claude API Key found: {CLAUDE_API_KEY[:15]}...")
+    else:
+        st.sidebar.error("❌ Claude API Key not found in any location")
+
+except Exception as e:
+    st.sidebar.error(f"❌ Error loading Claude API Key: {str(e)}")
+    CLAUDE_API_KEY = None
 
 # Configure Claude if available
 if HAS_CLAUDE and CLAUDE_API_KEY:
@@ -1423,6 +1460,112 @@ def guess_practice_name_from_url_with_llm(website_url: str, soup: BeautifulSoup)
         st.sidebar.write(f"⚠️ URL name guessing failed: {str(e)[:50]}")
         return ""
 
+# Basic extraction fallback functions for when Claude API is unavailable
+def basic_practice_name_extraction(soup: BeautifulSoup, website_url: str):
+    """Basic practice name extraction without LLM"""
+    if not soup:
+        return ""
+
+    # Try title tag
+    title = soup.find('title')
+    if title and title.text:
+        title_text = title.text.strip()
+        # Remove common suffixes
+        for suffix in [' - Home', ' | Home', ' - Dental', ' | Dental', ' - Dentist', ' | Dentist']:
+            if suffix in title_text:
+                title_text = title_text.replace(suffix, '').strip()
+        if len(title_text) > 3 and len(title_text) < 60:
+            return title_text
+
+    # Try h1 tags
+    h1_tags = soup.find_all('h1')
+    for h1 in h1_tags:
+        if h1.text and len(h1.text.strip()) > 3 and len(h1.text.strip()) < 60:
+            return h1.text.strip()
+
+    # Try meta description
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    if meta_desc and meta_desc.get('content'):
+        content = meta_desc.get('content').strip()
+        if 'dental' in content.lower() or 'dentist' in content.lower():
+            words = content.split()[:4]  # First 4 words
+            return ' '.join(words)
+
+    return ""
+
+def basic_email_extraction(soup: BeautifulSoup):
+    """Basic email extraction without LLM"""
+    if not soup:
+        return ""
+
+    # Find email pattern in text
+    import re
+    text_content = soup.get_text()
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, text_content)
+
+    # Filter out common non-contact emails
+    exclude_patterns = ['noreply', 'no-reply', 'donotreply', 'example.com', 'test.com', 'gmail.com', 'yahoo.com', 'hotmail.com']
+
+    for email in emails:
+        if not any(pattern in email.lower() for pattern in exclude_patterns):
+            return email
+
+    return ""
+
+def basic_phone_extraction(soup: BeautifulSoup):
+    """Basic phone extraction without LLM"""
+    if not soup:
+        return ""
+
+    import re
+    text_content = soup.get_text()
+
+    # Phone patterns
+    phone_patterns = [
+        r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # US format
+        r'\d{3}-\d{3}-\d{4}',
+        r'\(\d{3}\)\s?\d{3}-\d{4}',
+        r'\d{10}'
+    ]
+
+    for pattern in phone_patterns:
+        matches = re.findall(pattern, text_content)
+        for match in matches:
+            # Clean up the match
+            phone = re.sub(r'[^\d]', '', match)
+            if len(phone) == 10:
+                return f"({phone[:3]}) {phone[3:6]}-{phone[6:]}"
+
+    return ""
+
+def basic_address_extraction(soup: BeautifulSoup):
+    """Basic address extraction without LLM"""
+    if not soup:
+        return ""
+
+    # Look for common address patterns
+    text_content = soup.get_text()
+    import re
+
+    # Address pattern (number + street + common keywords)
+    address_pattern = r'\d+\s+[A-Za-z\s]+(Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Boulevard|Blvd|Lane|Ln|Way|Circle|Cir|Court|Ct)[^,]*,?\s*[A-Za-z\s]+,?\s*[A-Z]{2}\s*\d{5}'
+
+    matches = re.findall(address_pattern, text_content)
+    if matches:
+        return matches[0]
+
+    # Look for footer or contact section
+    footer = soup.find('footer')
+    if footer:
+        footer_text = footer.get_text()
+        lines = [line.strip() for line in footer_text.split('\n') if line.strip()]
+        for line in lines:
+            if any(keyword in line.lower() for keyword in ['address', 'location', 'visit']):
+                return line
+
+    return ""
+
 def prefill_from_website(website_url: str):
     """LLM-only extraction with URL-based practice name guessing"""
     if not website_url:
@@ -1490,32 +1633,51 @@ def prefill_from_website(website_url: str):
     api_key_preview = f"{CLAUDE_API_KEY[:15]}..." if CLAUDE_API_KEY else "None"
     st.sidebar.write(f"🔧 Debug: HAS_CLAUDE={HAS_CLAUDE}, API_KEY_SET={'Yes' if CLAUDE_API_KEY else 'No'} ({api_key_preview}), CLIENT_READY={'Yes' if claude_client else 'No'}")
 
-    # Test a simple Claude API call
+    # Test Claude API and determine extraction method
+    use_llm = False
     if claude_client:
         st.sidebar.write("🧪 Testing Claude API connection...")
         test_result = call_claude_api("Say 'test'", timeout=10)
         if test_result:
             st.sidebar.success(f"✅ Claude API test successful: {test_result[:20]}...")
+            use_llm = True
         else:
-            st.sidebar.error("❌ Claude API test failed")
+            st.sidebar.error("❌ Claude API test failed - using fallback extraction")
+    else:
+        st.sidebar.warning("⚠️ Claude API not available - using fallback extraction")
 
-    # Step 1: Guess practice name from URL and validate with LLM
-    st.sidebar.write("🏥 Extracting practice name...")
-    practice_name = guess_practice_name_from_url_with_llm(website_url, soup)
-    st.sidebar.write(f"🏥 Practice name result: {practice_name or 'None'}")
+    # Extract data using LLM or fallback methods
+    if use_llm:
+        st.sidebar.write("🤖 Using AI extraction...")
+        # Step 1: Guess practice name from URL and validate with LLM
+        st.sidebar.write("🏥 Extracting practice name...")
+        practice_name = guess_practice_name_from_url_with_llm(website_url, soup)
+        st.sidebar.write(f"🏥 Practice name result: {practice_name or 'None'}")
 
-    # Step 2: Extract all other fields using ONLY LLM
-    st.sidebar.write("🏠 Extracting address...")
-    addr = extract_address_with_llm(soup, website_url)
-    st.sidebar.write(f"🏠 Address result: {addr or 'None'}")
+        # Step 2: Extract all other fields using ONLY LLM
+        st.sidebar.write("🏠 Extracting address...")
+        addr = extract_address_with_llm(soup, website_url)
+        st.sidebar.write(f"🏠 Address result: {addr or 'None'}")
 
-    st.sidebar.write("📧 Extracting email...")
-    email = extract_email_with_llm(soup, website_url)
-    st.sidebar.write(f"📧 Email result: {email or 'None'}")
+        st.sidebar.write("📧 Extracting email...")
+        email = extract_email_with_llm(soup, website_url)
+        st.sidebar.write(f"📧 Email result: {email or 'None'}")
 
-    st.sidebar.write("📞 Extracting phone...")
-    phone = extract_phone_with_llm(soup, website_url)
-    st.sidebar.write(f"📞 Phone result: {phone or 'None'}")
+        st.sidebar.write("📞 Extracting phone...")
+        phone = extract_phone_with_llm(soup, website_url)
+        st.sidebar.write(f"📞 Phone result: {phone or 'None'}")
+    else:
+        st.sidebar.write("🔍 Using basic web scraping...")
+        # Fallback to basic extraction methods
+        practice_name = basic_practice_name_extraction(soup, website_url)
+        addr = basic_address_extraction(soup)
+        email = basic_email_extraction(soup)
+        phone = basic_phone_extraction(soup)
+
+        st.sidebar.write(f"🏥 Practice name: {practice_name or 'Not found'}")
+        st.sidebar.write(f"🏠 Address: {addr or 'Not found'}")
+        st.sidebar.write(f"📧 Email: {email or 'Not found'}")
+        st.sidebar.write(f"📞 Phone: {phone or 'Not found'}")
 
     # Step 4: Set messages for missing information and success indicators
     if not email:
